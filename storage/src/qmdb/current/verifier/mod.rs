@@ -143,14 +143,13 @@
 //! proofs still authenticate their own paths, so the overall upper bounds above
 //! remain conservative. See [`crate::merkle::Proof::verify_multi_inclusion`].
 //!
-//! The bundled prover always supplies explicit bitmap chunks and complete key proofs.
-//! Thus `p` and `f` are O(k), but `u` can be O(n / (8 * N) + 1): the floor-copy
-//! policy's entry limit bounds the live records copied, not the number of inactive
-//! bits crossed.
-//! Proving and verifying an honest proof can therefore depend on the old log's size
-//! even for a small batch. Zero-subtree proofs can reduce verifier coverage work,
-//! but this prover does not produce them. See `UserBatch::build_batch_proof` for
-//! database lookup, collision, and I/O costs in addition to these verification bounds.
+//! The bundled prover supplies complete key proofs and proves each run of clear bitmap
+//! chunks with the fewest aligned zero subtrees. The floor-copy policy's entry limit
+//! bounds the live records the scan reaches, not the inactive bits it crosses, but those
+//! bits cost O(log n) units per run. Thus `p`, `f`, and `u` are O(k) up to that logarithmic
+//! factor, and an honest bundle does not grow with the old log for a small batch. The
+//! prover still compares every scanned chunk in memory. See `UserBatch::build_batch_proof`
+//! for database lookup, collision, and I/O costs in addition to these verification bounds.
 
 // Bundles are untrusted input: report a malformed one as an error, never a panic.
 #![cfg_attr(
@@ -168,6 +167,8 @@
 )]
 
 mod bitmap;
+#[cfg(feature = "std")]
+mod builder;
 mod bundle;
 mod commitment;
 mod error;
@@ -177,6 +178,9 @@ mod ordered;
 mod root;
 mod sparse;
 mod subtree;
+#[cfg(test)]
+#[cfg(feature = "std")]
+mod tests;
 mod transition;
 mod trusted;
 mod user;
@@ -188,6 +192,8 @@ pub use bundle::{
     PreStateTerminalClaim,
 };
 pub use commitment::{CurrentCommitment, initial_commitment};
+#[cfg(feature = "std")]
+pub use error::BuildError;
 pub use error::{BitmapFault, CandidateFault, InsufficientPreState, VerifyError};
 pub use transition::Verified;
 pub use trusted::{

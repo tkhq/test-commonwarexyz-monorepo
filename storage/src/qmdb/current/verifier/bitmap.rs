@@ -5,6 +5,8 @@
 //! Graftable chunks are checked in both raw and grafted trees at operation-tree positions.
 //! Pending and partial chunks are checked against the pre-state root opening.
 
+#[cfg(feature = "std")]
+use super::subtree::create_multi_subtree_proof;
 use super::{
     BitmapFault, VerifyError,
     opening::AuthenticatedPreState,
@@ -30,6 +32,201 @@ type RequiredChunks = (ChunkIntervals, BTreeSet<u64>);
 /// The fewest raw and grafted targets for which [`verify_bitmap`] authenticates the two trees
 /// on the strategy; smaller proofs cost less to check than to dispatch.
 const PARALLEL_TARGETS: usize = 32;
+
+/// Produce exact coverage with chunk bytes, zero subtrees, and shared subtree inclusion paths.
+/// The verifier's interval calculation also drives production, so floor-scan gaps
+/// and unrelated extra chunks cannot be introduced by a different coverage rule.
+/// Each run of clear, graftable chunks whose bytes the verifier does not need becomes the
+/// fewest aligned zero subtrees whose roots exist, as [`zero_blocks`] splits it; every other
+/// chunk is sent in full. A batch's coverage therefore costs O(k * log n) units for `k`
+/// changed chunks and records reached by the floor walk, however many clear chunks the
+/// scan crosses: each clear run between them takes O(log n) blocks. CPU is O(w * N + (u + 1) * h * log((u + 1) * h + 2)) for `w` scanned
+/// chunks compared in memory, `u` emitted units, and height `h`; memory and node reads are
+/// O((u + 1) * h + e * N) for `e` explicit chunks, excluding backend costs.
+#[cfg(feature = "std")]
+pub(super) async fn build_bitmap_proof<F, K, V, H, B, R, G, const N: usize>(
+    pre_size: Location<F>,
+    old_floor: Location<F>,
+    floor_scan_end: Location<F>,
+    prepared: &PreparedOrderedBatch<F, K, V>,
+    bitmap: &B,
+    raw_storage: &R,
+    grafted_storage: &G,
+) -> Result<BitmapProof<F, H::Digest, N>, super::BuildError<F>>
+where
+    F: Graftable,
+    K: Key,
+    V: ValueEncoding,
+    H: Hasher,
+    B: commonware_utils::bitmap::Readable<N>,
+    R: merkle::storage::Storage<F, Digest = H::Digest>,
+    G: merkle::storage::Storage<F, Digest = H::Digest>,
+{
+    if pre_size == Location::new(1) {
+        return Ok(BitmapProof::Initial { floor_scan_end });
+    }
+    let chunk_bits = BitMap::<N>::CHUNK_SIZE_BITS;
+    let height = grafting::height::<N>();
+    let graftable = grafting::graftable_chunks::<F>(*pre_size, height).min(*pre_size / chunk_bits);
+    let (required, forced_explicit) = required_chunk_intervals(
+        pre_size,
+        old_floor,
+        floor_scan_end,
+        prepared,
+        chunk_bits,
+        graftable,
+    );
+    let chunk = |index: u64| {
+        usize::try_from(index)
+            .map(|index| bitmap.get_chunk(index))
+            .map_err(|_| super::BuildError::InvalidState("a bitmap chunk index exceeds usize"))
+    };
+    let mut units = Vec::new();
+    let mut raw_targets = Vec::new();
+    let mut grafted_targets = Vec::new();
+    let hasher = qmdb::hasher::<H>();
+    for (start, end) in required {
+        let mut chunk_index = start;
+        while chunk_index < end {
+            let mut run_end = chunk_index;
+            while run_end < end
+                && run_end < graftable
+                && !forced_explicit.contains(&run_end)
+                && chunk(run_end)? == BitMap::<N>::EMPTY_CHUNK
+            {
+                run_end += 1;
+            }
+            for (first_chunk, chunk_height) in
+                zero_blocks::<F>(chunk_index, run_end, *pre_size, height)
+            {
+                let leaf_start = Location::new(first_chunk * chunk_bits);
+                let target_height = height + chunk_height;
+                let position = F::subtree_root_position(leaf_start, target_height);
+                let digest = raw_storage
+                    .get_node(position)
+                    .await?
+                    .ok_or(merkle::Error::ElementPruned(position))?;
+                // A clear block grafts no bytes, so both trees hold the same digest there.
+                if grafted_storage.get_node(position).await? != Some(digest) {
+                    return Err(super::BuildError::InvalidState(
+                        "a clear bitmap block's grafted digest differs from its raw digest",
+                    ));
+                }
+                let target = SubtreeTarget {
+                    leaf_start,
+                    height: target_height,
+                    digest,
+                };
+                raw_targets.push(target);
+                grafted_targets.push(target);
+                units.push(BitmapUnit::zero_subtree(first_chunk, chunk_height, digest));
+            }
+            if run_end == end {
+                break;
+            }
+            let bytes = chunk(run_end)?;
+            let raw_subtree_digest = if run_end < graftable {
+                let leaf_start = Location::new(run_end * chunk_bits);
+                let position = F::subtree_root_position(leaf_start, height);
+                let digest = raw_storage
+                    .get_node(position)
+                    .await?
+                    .ok_or(merkle::Error::ElementPruned(position))?;
+                raw_targets.push(SubtreeTarget {
+                    leaf_start,
+                    height,
+                    digest,
+                });
+                let grafted_digest = if bytes == BitMap::<N>::EMPTY_CHUNK {
+                    digest
+                } else {
+                    hasher.hash(&[bytes.as_slice(), digest.as_ref()])
+                };
+                grafted_targets.push(SubtreeTarget {
+                    leaf_start,
+                    height,
+                    digest: grafted_digest,
+                });
+                Some(digest)
+            } else {
+                None
+            };
+            units.push(BitmapUnit::ExplicitChunk {
+                chunk_index: run_end,
+                bytes,
+                raw_subtree_digest,
+            });
+            chunk_index = run_end + 1;
+        }
+    }
+    let (raw_proof, grafted_proof) = if raw_targets.is_empty() {
+        (None, None)
+    } else {
+        (
+            Some(
+                create_multi_subtree_proof(
+                    raw_storage,
+                    F::inactive_peaks(pre_size, old_floor),
+                    &raw_targets,
+                )
+                .await?,
+            ),
+            Some(
+                create_multi_subtree_proof(
+                    grafted_storage,
+                    grafting::chunk_aligned_inactive_peaks::<F>(pre_size, old_floor, height)?,
+                    &grafted_targets,
+                )
+                .await?,
+            ),
+        )
+    };
+    let mut grafted_append_frontier = Vec::new();
+    for position in F::nodes_to_pin(pre_size) {
+        grafted_append_frontier.push(
+            grafted_storage
+                .get_node(position)
+                .await?
+                .ok_or(merkle::Error::ElementPruned(position))?,
+        );
+    }
+    Ok(BitmapProof::Proven(ProvenBitmapProof {
+        pre_size,
+        floor_scan_end,
+        units,
+        raw_proof,
+        grafted_proof,
+        grafted_append_frontier,
+    }))
+}
+
+/// Split the run of chunks `[first, end)` into the fewest aligned blocks whose roots exist in a
+/// tree of `leaves` operations, returning each block's first chunk and height in chunk-index
+/// space. A block of height `h` holds `2^h` chunks, starts at a multiple of `2^h`, and exists
+/// once the tree has formed its node at height `grafting_height + h`, which a Merkle mountain
+/// belt does only some time after the block's last leaf. The caller supplies graftable chunks,
+/// so a single chunk always exists.
+#[cfg(feature = "std")]
+pub(super) fn zero_blocks<F: Graftable>(
+    mut first: u64,
+    end: u64,
+    leaves: u64,
+    grafting_height: u32,
+) -> Vec<(u64, u32)> {
+    let mut blocks = Vec::new();
+    while first < end {
+        let mut chunk_height = first.trailing_zeros().min((end - first).ilog2());
+        while chunk_height > 0
+            && first >> chunk_height
+                >= grafting::graftable_chunks::<F>(leaves, grafting_height + chunk_height)
+        {
+            chunk_height -= 1;
+        }
+        blocks.push((first, chunk_height));
+        first += 1 << chunk_height;
+    }
+    blocks
+}
 
 /// Witnesses for activity bits read or changed while verifying one batch.
 /// Choose `Initial` only for the fixed initial checkpoint. All other states require
@@ -71,9 +268,9 @@ pub struct ProvenBitmapProof<F: Graftable, D: Digest, const N: usize> {
 
 /// One portion of the required bitmap coverage, measured in `8 * N`-bit chunks.
 /// Explicit bytes are required for chunks containing invalidated records, trailing
-/// chunks, and chunks cut by a scan boundary. Interior all-zero regions may use a
-/// shared raw/grafted subtree digest to avoid transmitting their bytes. Both forms
-/// are claims until roots are checked.
+/// chunks, and chunks cut by a scan boundary. Other all-zero regions may use a
+/// shared raw/grafted subtree digest instead of their bytes, as the bundled prover
+/// does. Both forms are claims until roots are checked.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BitmapUnit<F: Graftable, D: Digest, const N: usize> {
     /// Full bytes for one chunk.
