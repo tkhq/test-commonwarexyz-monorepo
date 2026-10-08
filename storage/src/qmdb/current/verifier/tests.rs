@@ -1,9 +1,9 @@
 //! End-to-end checks of proof construction and verification against the database writer.
 
 use super::{
-    BatchProofBundle, BitmapFault, BitmapProof, BitmapUnit, BuildError, CandidateFault,
-    CurrentCommitment, InsufficientPreState, PreStateKeyClaim, TrustedMap, UserBatch, UserOp,
-    VerifyError,
+    BatchProofBundle, BitmapFault, BitmapProof, BitmapUnit, BuildError, BundleConfig,
+    CandidateFault, CurrentCommitment, InsufficientPreState, PreStateKeyClaim,
+    PreStateOpeningClaim, TrustedMap, UserBatch, UserOp, VerifyError,
     subtree::{SubtreeTarget, create_multi_subtree_proof},
 };
 use crate::{
@@ -17,6 +17,7 @@ use crate::{
     },
     translator::OneCap,
 };
+use commonware_codec::{Decode as _, Encode as _};
 use commonware_cryptography::{Hasher, Sha256};
 use commonware_parallel::{Rayon, Sequential, Strategy, mocks::Explorer};
 use commonware_runtime::{Runner as _, Strategizer as _, buffer::paged::CacheRef, deterministic};
@@ -649,6 +650,91 @@ async fn without_zero_subtrees<F: Graftable, S: Strategy>(
     proof
 }
 
+/// The most digests any one Merkle proof, pinned-node list, or append frontier in `proof` holds.
+fn max_digests<F: Graftable>(proof: &Bundle<F>) -> usize {
+    use crate::qmdb::current::ordered::proof::constant::ExclusionProof;
+
+    let mut most = 0;
+    if let PreStateOpeningClaim::Proven { terminal, .. } = &proof.pre_state {
+        most = terminal
+            .raw_proof
+            .digests
+            .len()
+            .max(terminal.pins_before_terminal.len());
+    }
+    for claim in &proof.pre_state_claims {
+        let operation_proof = match claim {
+            PreStateKeyClaim::Member(member) => &member.proof.proof,
+            PreStateKeyClaim::Exclusion(exclusion) => match &exclusion.proof {
+                ExclusionProof::KeyValue(proof, _) | ExclusionProof::Commit(proof, _) => proof,
+            },
+        };
+        most = most.max(operation_proof.range_proof.proof.digests.len());
+    }
+    if let BitmapProof::Proven(bitmap) = &proof.bitmap {
+        for merkle_proof in bitmap.raw_proof.iter().chain(&bitmap.grafted_proof) {
+            most = most.max(merkle_proof.digests.len());
+        }
+        most = most.max(bitmap.grafted_append_frontier.len());
+    }
+    if let Some(raw) = &proof.pre_state_candidates.raw_multi_proof {
+        most = most.max(raw.digests.len());
+    }
+    most
+}
+
+/// Encode `proof`, require that it decodes to the same bytes under limits it exactly meets and
+/// that each limit one smaller refuses it, and return the decoded bundle.
+fn round_trip<F: Graftable>(proof: &Bundle<F>) -> Bundle<F> {
+    let units = match &proof.bitmap {
+        BitmapProof::Initial { .. } => 0,
+        BitmapProof::Proven(bitmap) => bitmap.units.len(),
+    };
+    let exact = BundleConfig {
+        max_claims: proof.pre_state_claims.len(),
+        max_candidates: proof.pre_state_candidates.operations.len(),
+        max_bitmap_units: units,
+        max_digests: max_digests(proof),
+        key: (),
+        update: (),
+        operation: (),
+        value: (),
+    };
+    let encoded = proof.encode();
+    let decoded = Bundle::<F>::decode_cfg(encoded.clone(), &exact).unwrap();
+    assert_eq!(decoded.encode(), encoded);
+    let limits = [
+        exact.max_claims,
+        exact.max_candidates,
+        exact.max_bitmap_units,
+        exact.max_digests,
+    ];
+    let tighter = [
+        BundleConfig {
+            max_claims: exact.max_claims.wrapping_sub(1),
+            ..exact.clone()
+        },
+        BundleConfig {
+            max_candidates: exact.max_candidates.wrapping_sub(1),
+            ..exact.clone()
+        },
+        BundleConfig {
+            max_bitmap_units: exact.max_bitmap_units.wrapping_sub(1),
+            ..exact.clone()
+        },
+        BundleConfig {
+            max_digests: exact.max_digests.wrapping_sub(1),
+            ..exact
+        },
+    ];
+    for (limit, config) in limits.into_iter().zip(tighter) {
+        if limit > 0 {
+            assert!(Bundle::<F>::decode_cfg(encoded.clone(), &config).is_err());
+        }
+    }
+    decoded
+}
+
 /// Apply each of `setup` through the writer alone, then prove, merkleize, verify and apply each
 /// of `batches` under `policy`.
 ///
@@ -719,14 +805,15 @@ where
         probe(&batch, pre, &proof, post);
         reject_forgeries(&batch, pre, &proof, post, &verifier_policy, db.is_empty());
 
-        // A recipient with no cache must also be able to verify this complete bundle, and it
-        // need not carry the facts forward.
+        // A recipient with no cache must also be able to verify this complete bundle, sent as
+        // bytes, and it need not carry the facts forward.
         let before = verifier_policy.clone();
+        let received = round_trip(&proof);
         let fresh = batch
             .verify(
                 pre,
                 TrustedMap::empty_cache(pre),
-                &proof,
+                &received,
                 post,
                 &mut before.clone(),
             )
