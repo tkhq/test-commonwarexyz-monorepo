@@ -32,6 +32,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "qmdb_lite_verifier"
+path = "fuzz_targets/qmdb_lite_verifier.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "qmdb_any_unordered_batch_root"
 path = "fuzz_targets/qmdb_any_unordered_batch_root.rs"
 test = false
