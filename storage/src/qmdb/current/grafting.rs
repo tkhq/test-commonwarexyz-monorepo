@@ -142,7 +142,6 @@ pub(super) fn graft_chunk_digests<H: Hasher, S: Strategy, const N: usize>(
 /// floor falls inside a root peak or inside a multi-peak chunk group, the partially covered chunk
 /// stays in the graftable region and the inactive peak count is rounded down to the latest chunk
 /// boundary expressible by whole root peaks.
-#[cfg_attr(not(feature = "std"), allow(dead_code))]
 pub(super) fn chunk_aligned_inactive_peaks<F: Family>(
     leaves: Location<F>,
     inactivity_floor: Location<F>,
