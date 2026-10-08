@@ -373,6 +373,7 @@ mod roots;
 pub(crate) mod sync;
 #[cfg(feature = "std")]
 pub mod unordered;
+pub mod verifier;
 
 #[cfg(feature = "std")]
 use self::db::Metrics;
