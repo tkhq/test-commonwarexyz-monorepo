@@ -22,6 +22,53 @@ pub(crate) struct SubtreeTarget<F: Family, D: Digest> {
 
 type Parent<F> = (Position<F>, Position<F>, Position<F>);
 
+/// Read the missing frontier nodes in the exact order consumed by verification.
+/// Reusing the same subtree plan binds witness placement to the target geometry.
+#[cfg(feature = "std")]
+pub(super) async fn create_multi_subtree_proof<F: Family, D: Digest>(
+    storage: &impl merkle::storage::Storage<F, Digest = D>,
+    inactive_peaks: usize,
+    targets: &[SubtreeTarget<F, D>],
+) -> Result<merkle::Proof<F, D>, merkle::Error<F>> {
+    let leaves = Location::try_from(storage.size())?;
+    let mut frontier = BTreeMap::new();
+    let mut parents = Vec::new();
+    let mut start = 0;
+    let mut remaining = targets;
+    for (position, height) in F::peaks(storage.size()) {
+        let end = start + (1u64 << height);
+        let split = remaining.partition_point(|target| target.leaf_start.as_u64() < end);
+        let (peak_targets, rest) = remaining.split_at(split);
+        plan(
+            position,
+            height,
+            start,
+            peak_targets,
+            &mut frontier,
+            &mut parents,
+        )
+        .map_err(|_| merkle::Error::InvalidProof)?;
+        remaining = rest;
+        start = end;
+    }
+    let mut digests = Vec::new();
+    for (position, target) in frontier {
+        if target.is_none() {
+            digests.push(
+                storage
+                    .get_node(position)
+                    .await?
+                    .ok_or(merkle::Error::ElementPruned(position))?,
+            );
+        }
+    }
+    Ok(merkle::Proof {
+        leaves,
+        inactive_peaks,
+        digests,
+    })
+}
+
 /// Partition one peak into supplied targets and missing witness subtrees.
 ///
 /// The bitmap proof provides subtree digests instead of individual leaves. Build a
