@@ -1,7 +1,7 @@
 //! Type-state for operations with fixed or variable size.
 
 use commonware_codec::{CodecFixedShared, CodecShared};
-use std::marker::PhantomData;
+use core::marker::PhantomData;
 
 mod sealed {
     use commonware_codec::CodecShared;

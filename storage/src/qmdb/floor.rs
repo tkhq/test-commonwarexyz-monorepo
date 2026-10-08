@@ -34,6 +34,8 @@
 //! A walk reads candidates in rounds and may hold the operations of up to `entries` reached
 //! candidates in memory at once.
 
+#![cfg_attr(not(feature = "std"), allow(dead_code))]
+
 use crate::merkle::{Family, Location};
 use commonware_utils::Widen;
 use core::marker::PhantomData;

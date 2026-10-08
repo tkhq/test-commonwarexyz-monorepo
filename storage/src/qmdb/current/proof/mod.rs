@@ -32,30 +32,44 @@
 //! Pending and partial slots are independent: at gh >= 3 they can coexist. When both are present,
 //! pending hashes in before partial.
 
+#[cfg(feature = "std")]
 use crate::{
     journal::contiguous::Contiguous,
-    merkle::{
-        self, Family, Graftable, Location, PendingChunk, Position, Proof, hasher::Hasher as _,
-        storage::Storage,
-    },
+    merkle::storage::Storage,
     qmdb::{
         self, Error,
-        current::{
-            db::{combine_roots, graftable_chunk_window, partial_chunk, pending_chunk},
-            grafting,
-        },
+        current::db::{graftable_chunk_window, partial_chunk, pending_chunk},
     },
 };
+use crate::{
+    merkle::{
+        self, Family, Graftable, Location, PendingChunk, Position, Proof, hasher::Hasher as _,
+    },
+    qmdb::{
+        current::{grafting, roots::combine_roots},
+        verify::ExtractedDigests,
+    },
+};
+#[cfg(feature = "std")]
 use ahash::AHashMap;
+use alloc::vec::Vec;
 use bytes::BufMut;
 use commonware_codec::{Buf, Encode, EncodeSize, Read, ReadExt as _, Write, varint::UInt};
 use commonware_cryptography::{Digest, Hasher};
-use commonware_utils::{
-    Widen,
-    bitmap::{Prunable as BitMap, Readable as BitmapReadable},
-};
-use core::{num::NonZeroU64, ops::Range};
+use commonware_utils::Widen;
+#[cfg(feature = "std")]
+use commonware_utils::bitmap::Prunable as BitMap;
+#[cfg(feature = "std")]
+use commonware_utils::bitmap::Readable as BitmapReadable;
+use core::num::NonZeroU64;
+#[cfg(feature = "std")]
+use core::ops::Range;
+#[cfg(feature = "std")]
 use tracing::debug;
+#[cfg(not(feature = "std"))]
+macro_rules! debug {
+    ($($args:tt)*) => {};
+}
 
 pub mod operation;
 
@@ -88,6 +102,7 @@ pub(super) fn chunk_bits(chunk_size: usize) -> Result<u64, commonware_codec::Err
 /// pruning exceeds the graftable prefix. Returns [Error::OperationPruned] for a queried
 /// operation in a pruned chunk, and [merkle::Error::RangeOutOfBounds] for a queried operation
 /// outside the snapshot.
+#[cfg(feature = "std")]
 pub fn required_chunks<F: Graftable, const N: usize>(
     ops_leaves: Location<F>,
     bitmap_len: u64,
@@ -257,6 +272,7 @@ pub struct RangeProofSpec<F: Family, D: Digest> {
 impl<F: Graftable, D: Digest> RangeProof<F, D> {
     /// Create a new range proof for the provided `range` of operations, fetching the digests of
     /// its [merkle::RangePlan] from `storage` and building with [Self::build].
+    #[cfg(feature = "std")]
     pub async fn new<H: Hasher<Digest = D>, S: Storage<F, Digest = D>, const N: usize>(
         status: &impl BitmapReadable<N>,
         storage: &S,
@@ -291,6 +307,7 @@ impl<F: Graftable, D: Digest> RangeProof<F, D> {
     /// Returns the errors of [merkle::RangePlan::build], and [Error::DataCorrupted] if the bitmap
     /// and the plan's leaf count imply more than one pending chunk or pruning beyond the graftable
     /// chunks.
+    #[cfg(feature = "std")]
     pub fn build<H: Hasher<Digest = D>, const N: usize>(
         status: &impl BitmapReadable<N>,
         plan: merkle::RangePlan<F>,
@@ -335,6 +352,7 @@ impl<F: Graftable, D: Digest> RangeProof<F, D> {
     /// Returns [Error::OperationPruned] if `start_loc` falls in a pruned bitmap chunk.
     /// Returns [`merkle::Error::LocationOverflow`] if `start_loc` > [merkle::Family::MAX_LEAVES].
     /// Returns [`merkle::Error::RangeOutOfBounds`] if `start_loc` >= number of leaves in the tree.
+    #[cfg(feature = "std")]
     pub async fn new_with_ops<
         H: Hasher<Digest = D>,
         C: Contiguous,
@@ -385,16 +403,16 @@ impl<F: Graftable, D: Digest> RangeProof<F, D> {
         Ok((proof, ops, chunks))
     }
 
-    /// Reconstruct the canonical current root, optionally collecting the positioned digests
-    /// required to compute the peaks covering the proven range.
-    fn reconstruct_root<H, O>(
+    /// Reconstruct the canonical root and its grafted component. Callers must authenticate
+    /// the canonical root before using either result.
+    fn reconstruct_roots<H, O>(
         &self,
         start_loc: Location<F>,
         ops: &[O],
         chunks: &[impl AsRef<[u8]>],
         chunk_size: usize,
         collected: Option<&mut Vec<(Position<F>, D)>>,
-    ) -> Result<D, merkle::Error<F>>
+    ) -> Result<(D, D), merkle::Error<F>>
     where
         H: Hasher<Digest = D>,
         O: Encode,
@@ -525,20 +543,21 @@ impl<F: Graftable, D: Digest> RangeProof<F, D> {
             collected,
         ) {
             Ok(root) => root,
-            Err(error) => {
-                debug!(?error, "invalid proof input");
+            Err(_error) => {
+                debug!(?_error, "invalid proof input");
                 return Err(merkle::Error::InvalidProof);
             }
         };
 
         let partial =
             has_partial_chunk.then(|| (next_bit, self.partial_chunk_digest.as_ref().unwrap()));
-        Ok(combine_roots::<H>(
+        let current_root = combine_roots::<H>(
             &self.ops_root,
             &merkle_root,
             self.pending_chunk_digest.as_ref(),
             partial,
-        ))
+        );
+        Ok((current_root, merkle_root))
     }
 
     /// Return true if the given sequence of `ops` were applied starting at location `start_loc` in
@@ -571,8 +590,8 @@ impl<F: Graftable, D: Digest> RangeProof<F, D> {
         root: &D,
     ) -> bool {
         matches!(
-            self.reconstruct_root::<H, O>(start_loc, ops, chunks, chunk_size, None),
-            Ok(reconstructed_root) if reconstructed_root == *root
+            self.reconstruct_roots::<H, O>(start_loc, ops, chunks, chunk_size, None),
+            Ok((reconstructed_root, _)) if reconstructed_root == *root
         )
     }
 }
@@ -585,15 +604,15 @@ pub fn verify_proof_and_extract_digests<F, Op, H, const N: usize>(
     operations: &[Op],
     chunks: &[[u8; N]],
     target_root: &H::Digest,
-) -> Result<qmdb::verify::ExtractedDigests<F, H>, merkle::Error<F>>
+) -> Result<ExtractedDigests<F, H>, merkle::Error<F>>
 where
     F: Graftable,
     Op: Encode,
     H: Hasher,
 {
     let mut collected = Vec::new();
-    let reconstructed_root =
-        proof.reconstruct_root::<H, Op>(start_loc, operations, chunks, N, Some(&mut collected))?;
+    let (reconstructed_root, _) =
+        proof.reconstruct_roots::<H, Op>(start_loc, operations, chunks, N, Some(&mut collected))?;
     if reconstructed_root != *target_root {
         debug!("verification failed, root mismatch");
         return Err(merkle::Error::RootMismatch);
@@ -700,6 +719,7 @@ pub mod dynamic {
 }
 
 #[cfg(test)]
+#[cfg(feature = "std")]
 mod tests {
     use super::*;
     use crate::{

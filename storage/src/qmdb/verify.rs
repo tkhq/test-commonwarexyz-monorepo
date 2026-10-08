@@ -1,9 +1,14 @@
+#[cfg(feature = "std")]
+use crate::merkle::verification::ProofStore;
 use crate::{
-    merkle::{Error, Family, Location, Position, Proof, verification::ProofStore},
+    merkle::{Error, Family, Location, Position, Proof},
     qmdb,
 };
+use alloc::vec::Vec;
 use commonware_codec::Encode;
-use commonware_cryptography::{Digest, DigestOf, Hasher};
+#[cfg(feature = "std")]
+use commonware_cryptography::Digest;
+use commonware_cryptography::{DigestOf, Hasher};
 
 /// Digests extracted from a verified proof, paired with their Merkle positions.
 pub type ExtractedDigests<F, H> = Vec<(Position<F>, DigestOf<H>)>;
@@ -62,6 +67,7 @@ where
 }
 
 /// Verify a [Proof] and convert it into a [ProofStore].
+#[cfg(feature = "std")]
 pub fn create_proof_store<H, F, Op>(
     proof: &Proof<F, DigestOf<H>>,
     start_loc: Location<F>,
@@ -91,6 +97,7 @@ where
 /// - For backward-folded proofs, the active suffix peaks that were collapsed into the source
 ///   proof's synthetic accumulator. Use [`ProofStore::suffix_peak_positions`] to enumerate
 ///   them; missing entries surface as [`Error::CompressedDigest`].
+#[cfg(feature = "std")]
 pub fn create_multi_proof<F, D>(
     proof_store: &ProofStore<F, D>,
     locations: &[Location<F>],
@@ -126,6 +133,7 @@ where
 }
 
 #[cfg(test)]
+#[cfg(feature = "std")]
 mod tests {
     use super::*;
     use crate::{

@@ -1,14 +1,18 @@
 //! Operation proofs with fixed-size or runtime-sized bitmap chunks.
 
 use super::{RangeProof, chunk_bits};
+use crate::merkle::{Graftable, Location};
+#[cfg(feature = "std")]
 use crate::{
-    merkle::{ElementPlan, Graftable, Location, Position, storage::Storage},
+    merkle::{ElementPlan, Position, storage::Storage},
     qmdb::Error,
 };
 use bytes::{BufMut, Bytes};
 use commonware_codec::{Buf, Encode, EncodeSize, Read, ReadExt as _, Write, util::at_least};
 use commonware_cryptography::{Digest, Hasher};
+#[cfg(feature = "std")]
 use commonware_utils::bitmap::{Prunable as BitMap, Readable as BitmapReadable};
+#[cfg(feature = "std")]
 use tracing::debug;
 
 /// A proof that a specific operation is currently active in the database.
@@ -28,6 +32,7 @@ pub struct Proof<F: Graftable, D: Digest, C> {
     pub range_proof: RangeProof<F, D>,
 }
 
+#[cfg(feature = "std")]
 impl<F: Graftable, D: Digest, const N: usize> Proof<F, D, [u8; N]> {
     /// Return an inclusion proof that incorporates activity status for the operation at `loc`,
     /// fetching the range proof over `loc..loc + 1` with [RangeProof::new].
@@ -89,25 +94,38 @@ impl<F: Graftable, D: Digest, C: AsRef<[u8]>> Proof<F, D, C> {
     /// Return true if the proof authenticates that `operation` is active in the database with
     /// the provided `root`.
     pub fn verify<H: Hasher<Digest = D>, O: Encode>(&self, operation: O, root: &D) -> bool {
+        self.verify_and_reconstruct_grafted_root::<H, O>(&operation, root)
+            .is_some()
+    }
+
+    /// Authenticate the operation and return the grafted root for binding to a pre-state opening.
+    pub(crate) fn verify_and_reconstruct_grafted_root<H: Hasher<Digest = D>, O: Encode>(
+        &self,
+        operation: &O,
+        root: &D,
+    ) -> Option<D> {
         let chunk = self.chunk.as_ref();
         let Ok(bits) = chunk_bits(chunk.len()) else {
             debug!("proof verification failed, invalid chunk size");
-            return false;
+            return None;
         };
 
         let bit = *self.loc % bits;
         if chunk[(bit / 8) as usize] & (1 << (bit % 8)) == 0 {
             debug!(?self.loc, "proof verification failed, operation is inactive");
-            return false;
+            return None;
         }
 
-        self.range_proof.verify_with_chunk_size::<H, O>(
+        match self.range_proof.reconstruct_roots::<H, O>(
             self.loc,
-            &[operation],
+            core::slice::from_ref(operation),
             core::slice::from_ref(&self.chunk),
             chunk.len(),
-            root,
-        )
+            None,
+        ) {
+            Ok((current_root, grafted_root)) if current_root == *root => Some(grafted_root),
+            _ => None,
+        }
     }
 }
 

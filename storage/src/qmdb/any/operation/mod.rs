@@ -2,10 +2,10 @@ use crate::{
     merkle::{Family, Location},
     qmdb::{any::value::ValueEncoding, operation::Committable},
 };
+use bytes::BufMut;
 use commonware_codec::{Buf, Encode as _, Error as CodecError, Read, Write};
 use commonware_formatting::hex;
-use commonware_runtime::BufMut;
-use std::fmt;
+use core::fmt;
 
 pub(crate) mod fixed;
 pub(crate) mod update;
@@ -161,7 +161,7 @@ mod tests {
 
     fn roundtrip<T>(value: &T, cfg: &<T as Read>::Cfg)
     where
-        T: Codec + PartialEq + std::fmt::Debug,
+        T: Codec + PartialEq + core::fmt::Debug,
     {
         let encoded = value.encode();
         let decoded = T::decode_cfg(encoded.clone(), cfg).expect("decode");

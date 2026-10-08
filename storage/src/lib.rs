@@ -15,11 +15,11 @@ commonware_macros::stability_scope!(ALPHA {
 
     pub mod bmt;
     pub mod merkle;
+    pub mod qmdb;
     pub use merkle::{mmb, mmr};
 });
 commonware_macros::stability_scope!(ALPHA, cfg(feature = "std") {
     mod bitmap;
-    pub mod qmdb;
     pub use crate::bitmap::{BitMap as AuthenticatedBitMap, MerkleizedBitMap, UnmerkleizedBitMap};
     pub mod cache;
     pub mod queue;

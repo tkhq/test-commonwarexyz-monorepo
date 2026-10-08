@@ -60,18 +60,24 @@
 //!
 //! The grafted tree is incrementally maintained when grafted leaves change.
 
+#[cfg(feature = "std")]
+use crate::merkle::{Readable, storage::Storage as StorageTrait};
 use crate::{
-    merkle::{
-        self, Family, Graftable, Location, Position, Readable, hasher::Hasher as HasherTrait,
-        storage::Storage as StorageTrait,
-    },
+    merkle::{self, Family, Graftable, Location, Position, hasher::Hasher as HasherTrait},
     qmdb,
 };
+use alloc::vec::Vec;
 use commonware_cryptography::Hasher;
+#[cfg(feature = "std")]
 use commonware_parallel::Strategy;
 use commonware_utils::bitmap::BitMap;
 use core::{cmp::Ordering, marker::PhantomData};
+#[cfg(feature = "std")]
 use tracing::debug;
+#[cfg(not(feature = "std"))]
+macro_rules! debug {
+    ($($args:tt)*) => {};
+}
 
 /// Get the grafting height for a bitmap with chunk size determined by N.
 pub const fn height<const N: usize>() -> u32 {
@@ -79,6 +85,7 @@ pub const fn height<const N: usize>() -> u32 {
 }
 
 /// Return a [GraftedHasher] over QMDB's fixed Merkle hasher configuration.
+#[cfg(feature = "std")]
 pub(super) const fn hasher<F: Graftable, H: Hasher>(
     grafting_height: u32,
 ) -> GraftedHasher<F, merkle::hasher::Standard<H>> {
@@ -107,6 +114,7 @@ pub fn graftable_chunks<F: Graftable>(ops_leaves: u64, grafting_height: u32) -> 
 /// Compute grafted leaf digests for resolved `(chunk_idx, chunk_ops_digest, chunk)` triples:
 /// each leaf is `hash(chunk || chunk_ops_digest)`, except all-zero chunks preserve
 /// `chunk_ops_digest` directly (zero-chunk identity).
+#[cfg(feature = "std")]
 pub(super) fn graft_chunk_digests<H: Hasher, S: Strategy, const N: usize>(
     strategy: &S,
     inputs: Vec<(usize, H::Digest, [u8; N])>,
@@ -134,6 +142,7 @@ pub(super) fn graft_chunk_digests<H: Hasher, S: Strategy, const N: usize>(
 /// floor falls inside a root peak or inside a multi-peak chunk group, the partially covered chunk
 /// stays in the graftable region and the inactive peak count is rounded down to the latest chunk
 /// boundary expressible by whole root peaks.
+#[cfg_attr(not(feature = "std"), allow(dead_code))]
 pub(super) fn chunk_aligned_inactive_peaks<F: Family>(
     leaves: Location<F>,
     inactivity_floor: Location<F>,
@@ -181,6 +190,7 @@ pub(super) fn chunk_aligned_inactive_peaks<F: Family>(
 /// # Panics
 ///
 /// Panics if `ops_pos` is below the grafting height.
+#[cfg(feature = "std")]
 pub fn ops_to_grafted_pos<F: Graftable>(ops_pos: Position<F>, grafting_height: u32) -> Position<F> {
     let ops_height = F::pos_to_height(ops_pos);
     assert!(
@@ -197,6 +207,7 @@ pub fn ops_to_grafted_pos<F: Graftable>(ops_pos: Position<F>, grafting_height: u
 
 /// Convert a grafted position to the ops-family position whose subtree covers the same ops-leaf
 /// range.
+#[cfg(feature = "std")]
 pub fn grafted_to_ops_pos<F: Graftable>(
     grafted_pos: Position<F>,
     grafting_height: u32,
@@ -217,12 +228,14 @@ pub fn grafted_to_ops_pos<F: Graftable>(
 /// [`Graftable::subtree_root_position`], ensuring hash pre-images use ops-space positions for
 /// domain separation.
 #[derive(Clone)]
+#[cfg(feature = "std")]
 pub(super) struct GraftedHasher<F: Graftable, H: HasherTrait<F>> {
     inner: H,
     grafting_height: u32,
     _family: PhantomData<F>,
 }
 
+#[cfg(feature = "std")]
 impl<F: Graftable, H: HasherTrait<F>> GraftedHasher<F, H> {
     pub(super) const fn new(inner: H, grafting_height: u32) -> Self {
         Self {
@@ -233,6 +246,7 @@ impl<F: Graftable, H: HasherTrait<F>> GraftedHasher<F, H> {
     }
 }
 
+#[cfg(feature = "std")]
 impl<F: Graftable, H: HasherTrait<F>> HasherTrait<F> for GraftedHasher<F, H> {
     type Digest = H::Digest;
 
@@ -424,6 +438,7 @@ impl<F: Graftable, H: Hasher> HasherTrait<F> for Verifier<'_, F, H> {
 ///
 /// Both the ops structure and the grafted structure use the same [Family] `F`. The combined storage
 /// presents as `StorageTrait<F>` so that callers generic over `F` can use it transparently.
+#[cfg(feature = "std")]
 pub(super) struct Storage<
     'a,
     F: Graftable,
@@ -437,6 +452,7 @@ pub(super) struct Storage<
     grafted_hasher: GraftedHasher<F, merkle::hasher::Standard<H>>,
 }
 
+#[cfg(feature = "std")]
 impl<
     'a,
     F: Graftable,
@@ -490,6 +506,7 @@ impl<
     }
 }
 
+#[cfg(feature = "std")]
 impl<
     F: Graftable,
     H: Hasher,
@@ -552,6 +569,7 @@ impl<
 }
 
 #[cfg(test)]
+#[cfg(feature = "std")]
 mod tests {
     use super::*;
     use crate::{
