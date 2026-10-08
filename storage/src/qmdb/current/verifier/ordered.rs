@@ -602,3 +602,296 @@ where
         post_empty,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        merkle::mmr,
+        qmdb::{
+            any::value::FixedEncoding,
+            current::verifier::{CurrentCommitment, PartialTrustedState, UserBatch},
+        },
+    };
+    use alloc::vec;
+    use commonware_cryptography::Sha256;
+    use commonware_utils::sequence::FixedBytes;
+
+    type F = mmr::Family;
+    type Key = FixedBytes<8>;
+    type Map = TrustedMap<F, Key, FixedEncoding<Key>, Sha256, 32>;
+    type Batch = UserBatch<Key, Key>;
+
+    /// An application operation as its key and, for an update, its value and successor.
+    type Plain = (u64, Option<(u64, u64)>);
+
+    fn key(index: u64) -> Key {
+        FixedBytes::new(index.to_be_bytes())
+    }
+
+    fn index(key: &Key) -> u64 {
+        u64::from_be_bytes(key.as_ref().try_into().unwrap())
+    }
+
+    /// Bind `state` to a ten-operation checkpoint.
+    fn bind(state: TrustedState<F, Key, Key>) -> Map {
+        let commitment =
+            CurrentCommitment::from_parts(Location::new(10), Sha256::hash(&[b"root".as_slice()]))
+                .unwrap();
+        TrustedMap::from_state(commitment, state).unwrap()
+    }
+
+    fn partial(entries: impl IntoIterator<Item = TrustedEntry<F, Key, Key>>) -> Map {
+        bind(TrustedState::Partial(
+            PartialTrustedState::new(entries, []).unwrap(),
+        ))
+    }
+
+    /// Every fact about a database whose keys 10, 20, 30 and 40 sit at locations 1 to 4, each
+    /// holding its own key as value.
+    fn full() -> Map {
+        let keys = [10, 20, 30, 40];
+        partial((0..keys.len()).map(|i| TrustedEntry {
+            key: key(keys[i]),
+            location: KnownTrusted(Location::new(i as u64 + 1)),
+            value: KnownTrusted(key(keys[i])),
+            next_key: KnownTrusted(key(keys[(i + 1) % keys.len()])),
+        }))
+    }
+
+    /// Expand the batch's ranges and derive its transition.
+    fn derive(
+        map: &Map,
+        batch: &Batch,
+    ) -> Result<PreparedOrderedBatch<F, Key, FixedEncoding<Key>>, VerifyError> {
+        derive_ordered_transition(map, &expand_range_deletes(map, batch.ops())?)
+    }
+
+    fn plain(prepared: &PreparedOrderedBatch<F, Key, FixedEncoding<Key>>) -> Vec<Plain> {
+        prepared
+            .application_ops
+            .iter()
+            .map(|op| match op {
+                Operation::Delete(key) => (index(key), None),
+                Operation::Update(update) => (
+                    index(&update.key),
+                    Some((index(&update.value), index(&update.next_key))),
+                ),
+                Operation::CommitFloor(..) => unreachable!("derivation appends no commit"),
+            })
+            .collect()
+    }
+
+    fn superseded(prepared: &PreparedOrderedBatch<F, Key, FixedEncoding<Key>>) -> Vec<u64> {
+        prepared
+            .superseded
+            .iter()
+            .map(|location| **location)
+            .collect()
+    }
+
+    fn set(index: u64, value: u64) -> UserOp<Key, Key> {
+        UserOp::set(key(index), key(value))
+    }
+
+    fn delete(index: u64) -> UserOp<Key, Key> {
+        UserOp::delete(key(index))
+    }
+
+    #[test]
+    fn a_creation_rewrites_its_predecessor() {
+        let prepared = derive(&full(), &Batch::from([set(25, 99)])).unwrap();
+        assert_eq!(
+            plain(&prepared),
+            vec![(25, Some((99, 30))), (20, Some((20, 25)))]
+        );
+        assert_eq!(superseded(&prepared), vec![2]);
+        assert_eq!(prepared.made_inactive(), 1);
+        assert!(!prepared.post_empty);
+    }
+
+    #[test]
+    fn a_creation_after_the_last_key_wraps() {
+        let prepared = derive(&full(), &Batch::from([set(50, 99)])).unwrap();
+        assert_eq!(
+            plain(&prepared),
+            vec![(50, Some((99, 10))), (40, Some((40, 50)))]
+        );
+    }
+
+    #[test]
+    fn deleting_a_run_links_around_it_once() {
+        let prepared = derive(&full(), &Batch::from([delete(20), delete(30)])).unwrap();
+        assert_eq!(
+            plain(&prepared),
+            vec![(20, None), (30, None), (10, Some((10, 40)))]
+        );
+        assert_eq!(superseded(&prepared), vec![1, 2, 3]);
+        // Each delete is itself inactive, beside the three records it supersedes.
+        assert_eq!(prepared.made_inactive(), 5);
+    }
+
+    #[test]
+    fn a_set_predecessor_carries_its_new_link() {
+        let prepared = derive(&full(), &Batch::from([set(10, 77), set(15, 88)])).unwrap();
+        assert_eq!(
+            plain(&prepared),
+            vec![(10, Some((77, 15))), (15, Some((88, 20)))]
+        );
+        assert_eq!(superseded(&prepared), vec![1]);
+    }
+
+    #[test]
+    fn deleting_every_key_empties_the_database() {
+        let mut batch = Batch::new();
+        batch.delete_range(key(0)..=key(100)).unwrap();
+        let prepared = derive(&full(), &batch).unwrap();
+        assert_eq!(
+            plain(&prepared),
+            vec![(10, None), (20, None), (30, None), (40, None)]
+        );
+        assert!(prepared.post_empty);
+    }
+
+    #[test]
+    fn creations_in_an_empty_database_form_a_cycle() {
+        let empty = bind(TrustedState::EmptyDatabase);
+        let mut batch = Batch::from([set(5, 1), set(7, 2), delete(9)]);
+        batch.delete_range(key(20)..=key(30)).unwrap();
+        let prepared = derive(&empty, &batch).unwrap();
+        assert_eq!(plain(&prepared), vec![(5, Some((1, 7))), (7, Some((2, 5)))]);
+        assert!(prepared.superseded.is_empty() && !prepared.post_empty);
+    }
+
+    #[test]
+    fn ranges_enumerate_members_through_successors() {
+        let expanded = |batch: &Batch| {
+            expand_range_deletes(&full(), batch.ops())
+                .unwrap()
+                .into_iter()
+                .map(|(key, value)| (index(&key), value.is_some()))
+                .collect::<Vec<_>>()
+        };
+        let mut batch = Batch::new();
+        batch.delete_range(key(15)..=key(35)).unwrap();
+        assert_eq!(expanded(&batch), vec![(20, false), (30, false)]);
+        // A later set at 20 leaves the range starting just after it.
+        batch.delete_range(key(20)..=key(40)).unwrap();
+        batch.set(key(20), key(1));
+        assert_eq!(expanded(&batch), vec![(20, true), (30, false), (40, false)]);
+        let mut batch = Batch::new();
+        batch.delete_range(key(5)..=key(15)).unwrap();
+        batch.delete_range(key(45)..=key(60)).unwrap();
+        assert_eq!(expanded(&batch), vec![(10, false)]);
+    }
+
+    #[test]
+    fn open_ranges_start_at_the_least_key_and_end_at_the_wrap() {
+        let expanded = |map: &Map, range: (Bound<Key>, Bound<Key>)| {
+            let mut batch = Batch::new();
+            batch.delete_range(range).unwrap();
+            expand_range_deletes(map, batch.ops())
+                .map(|points| points.keys().map(index).collect::<Vec<_>>())
+        };
+        let full = full();
+        assert_eq!(
+            expanded(&full, (Bound::Unbounded, Bound::Included(key(25)))),
+            Ok(vec![10, 20])
+        );
+        assert_eq!(
+            expanded(&full, (Bound::Excluded(key(20)), Bound::Unbounded)),
+            Ok(vec![30, 40])
+        );
+        assert_eq!(
+            expanded(&full, (Bound::Unbounded, Bound::Unbounded)),
+            Ok(vec![10, 20, 30, 40])
+        );
+        // A range below the least key deletes nothing, but still needs the wrap to say so.
+        assert_eq!(
+            expanded(&full, (Bound::Unbounded, Bound::Excluded(key(10)))),
+            Ok(vec![])
+        );
+        // Without the greatest key's record, nothing says which key is least: 10 is not
+        // enough, since another key could precede it.
+        let without_wrap = partial([10, 20, 30].map(|i| TrustedEntry {
+            key: key(i),
+            location: KnownTrusted(Location::new(i / 10)),
+            value: KnownTrusted(key(i)),
+            next_key: KnownTrusted(key(i + 10)),
+        }));
+        assert_eq!(
+            expanded(&without_wrap, (Bound::Unbounded, Bound::Included(key(25)))),
+            Err(VerifyError::InsufficientPreState(
+                InsufficientPreState::OrderedEdge
+            ))
+        );
+    }
+
+    #[test]
+    fn missing_facts_are_errors_not_guesses() {
+        let missing =
+            |fact| -> Result<(), VerifyError> { Err(VerifyError::InsufficientPreState(fact)) };
+        let derived = |map: &Map, batch: Batch| derive(map, &batch).map(|_| ());
+        // Key 20 at location 2, holding 20 and followed by 30, without the facts marked false.
+        let twenty = |location: bool, value: bool, next: bool| TrustedEntry {
+            key: key(20),
+            location: if location {
+                KnownTrusted(Location::new(2))
+            } else {
+                Unknown
+            },
+            value: if value {
+                KnownTrusted(key(20))
+            } else {
+                Unknown
+            },
+            next_key: if next { KnownTrusted(key(30)) } else { Unknown },
+        };
+
+        // Nothing classifies 25 as a member or a non-member.
+        assert_eq!(
+            derived(&partial([]), Batch::from([set(25, 1)])),
+            missing(InsufficientPreState::Classification)
+        );
+        // Updating 20 needs its location.
+        assert_eq!(
+            derived(
+                &partial([twenty(false, true, true)]),
+                Batch::from([set(20, 1)])
+            ),
+            missing(InsufficientPreState::Location)
+        );
+        // Deleting 20 needs its predecessor, to link around it.
+        assert_eq!(
+            derived(
+                &partial([twenty(true, true, true)]),
+                Batch::from([delete(20)])
+            ),
+            missing(InsufficientPreState::OrderedEdge)
+        );
+        // Creating 25 rewrites 20, which needs 20's value.
+        assert_eq!(
+            derived(
+                &partial([twenty(true, false, true)]),
+                Batch::from([set(25, 1)])
+            ),
+            missing(InsufficientPreState::Value)
+        );
+        // A range cannot skip past a member whose successor is unknown.
+        let no_successor = partial([
+            TrustedEntry {
+                key: key(10),
+                location: KnownTrusted(Location::new(1)),
+                value: KnownTrusted(key(10)),
+                next_key: KnownTrusted(key(20)),
+            },
+            twenty(true, true, false),
+        ]);
+        let mut batch = Batch::new();
+        batch.delete_range(key(15)..=key(35)).unwrap();
+        assert_eq!(
+            derived(&no_successor, batch),
+            missing(InsufficientPreState::NextKey)
+        );
+    }
+}

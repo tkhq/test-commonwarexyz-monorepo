@@ -756,3 +756,143 @@ where
         grafted_nodes,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{merkle::mmr, qmdb::any::value::FixedEncoding};
+    use alloc::vec;
+    use commonware_cryptography::Sha256;
+    use commonware_utils::sequence::FixedBytes;
+
+    type F = mmr::Family;
+    type Key = FixedBytes<8>;
+
+    /// The required intervals and the chunks that need bytes, with 8-bit chunks.
+    fn required(
+        pre_size: u64,
+        old_floor: u64,
+        floor_scan_end: u64,
+        superseded: &[u64],
+        graftable_chunks: u64,
+    ) -> (Vec<(u64, u64)>, Vec<u64>) {
+        let prepared = PreparedOrderedBatch::<F, Key, FixedEncoding<Key>> {
+            application_ops: Vec::new(),
+            superseded: superseded.iter().map(|loc| Location::new(*loc)).collect(),
+            deleted_keys: BTreeSet::new(),
+            post_empty: false,
+        };
+        let (intervals, explicit) = required_chunk_intervals(
+            Location::new(pre_size),
+            Location::new(old_floor),
+            Location::new(floor_scan_end),
+            &prepared,
+            8,
+            graftable_chunks,
+        );
+        (intervals, explicit.into_iter().collect())
+    }
+
+    #[test]
+    fn coverage_spans_the_scan_and_every_changed_chunk() {
+        // The scan [10, 30) cuts chunks 1 and 3, so both need bytes. The superseded record at
+        // 50 and the terminal at 63 need theirs. Touching intervals stay separate.
+        assert_eq!(
+            required(64, 10, 30, &[50], 8),
+            (vec![(1, 4), (6, 7), (7, 8)], vec![1, 3, 6, 7])
+        );
+        // An aligned scan needs no boundary bytes; a change inside it merges into it.
+        assert_eq!(
+            required(64, 8, 24, &[12], 8),
+            (vec![(1, 3), (7, 8)], vec![1, 7])
+        );
+        // Without a scan, the pending chunk 7 and the partial chunk 8 still need bytes,
+        // since appends may graft or complete them.
+        assert_eq!(
+            required(70, 60, 60, &[], 7),
+            (vec![(7, 8), (8, 9)], vec![7, 8])
+        );
+    }
+
+    #[test]
+    fn a_view_reads_only_covered_bits() {
+        let view = VerifiedBitmapView::<F, <Sha256 as Hasher>::Digest, 1> {
+            floor_scan_end: Location::new(32),
+            explicit_chunks: BTreeMap::from([(0, [0b0000_0101]), (3, [0b1000_0000])]),
+            zero_ranges: vec![(1, 3)],
+            raw_nodes: BTreeMap::new(),
+            grafted_nodes: BTreeMap::new(),
+        };
+        let bit = |loc| view.bit(Location::new(loc));
+        assert_eq!(
+            [0, 1, 2, 8, 23, 24, 31].map(bit),
+            [true, false, true, false, false, false, true].map(Some)
+        );
+        // Chunk 4 is not covered, so its bits are unknown rather than clear.
+        assert_eq!(bit(32), None);
+        let set = |start, end| {
+            view.set_bits(Location::new(start), Location::new(end))
+                .map(|loc| *loc)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(set(0, 32), vec![0, 2, 31]);
+        assert_eq!(set(1, 31), vec![2]);
+        assert_eq!(set(3, 31), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn chunk_bits_set_and_clear_in_place() {
+        let mut chunk = [0u8; 2];
+        set_chunk_bit(&mut chunk, 9, true).unwrap();
+        // Locations index the whole bitmap, so 31 is bit 15 of its 16-bit chunk.
+        set_chunk_bit(&mut chunk, 16 + 15, true).unwrap();
+        assert_eq!(chunk, [0, 0b1000_0010]);
+        set_chunk_bit(&mut chunk, 9, false).unwrap();
+        assert_eq!(chunk, [0, 0b1000_0000]);
+    }
+
+    /// The prover's split of a clear run: aligned blocks that exist, covering the run exactly,
+    /// with no two neighbors it could have proven as one.
+    #[cfg(feature = "std")]
+    fn check_zero_blocks<Fam: Graftable>(leaves: u64, height: u32) {
+        let chunks = grafting::graftable_chunks::<Fam>(leaves, height);
+        for first in 0..chunks {
+            for end in first + 1..=chunks {
+                let blocks = zero_blocks::<Fam>(first, end, leaves, height);
+                let mut cursor = first;
+                for &(start, chunk_height) in &blocks {
+                    assert_eq!(start, cursor);
+                    assert!(start.is_multiple_of(1 << chunk_height));
+                    assert!(
+                        start >> chunk_height
+                            < grafting::graftable_chunks::<Fam>(leaves, height + chunk_height),
+                        "{start}/{chunk_height} does not exist at {leaves}"
+                    );
+                    cursor += 1 << chunk_height;
+                }
+                assert_eq!(cursor, end);
+                for pair in blocks.windows(2) {
+                    let ((left, left_height), (_, right_height)) = (pair[0], pair[1]);
+                    let mergeable = left_height == right_height
+                        && left.is_multiple_of(2 << left_height)
+                        && left >> (left_height + 1)
+                            < grafting::graftable_chunks::<Fam>(leaves, height + left_height + 1);
+                    assert!(!mergeable, "{pair:?} could be one block at {leaves}");
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn clear_runs_split_into_the_fewest_blocks_that_exist() {
+        assert_eq!(
+            zero_blocks::<F>(3, 12, 1 << 20, 1),
+            vec![(3, 0), (4, 2), (8, 2)]
+        );
+        for leaves in [64, 100, 127, 128, 200, 255, 256, 300] {
+            check_zero_blocks::<mmr::Family>(leaves, 2);
+            check_zero_blocks::<crate::merkle::mmb::Family>(leaves, 2);
+        }
+    }
+}
