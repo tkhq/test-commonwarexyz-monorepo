@@ -39,6 +39,13 @@
 //! `commonware-storage/std` also enables storage in that build. The verifier API and
 //! implementation are the same in both configurations.
 //!
+//! # Wire format
+//!
+//! [`CurrentCommitment`] and [`BatchProofBundle`] implement the codec traits, so a writer
+//! can send a bundle and its claimed post-commitment as bytes. Decode a bundle with a
+//! [`BundleConfig`] whose limits bound every length in it: decoding allocates no more than
+//! they allow and checks only the encoding, which leaves every claim to verification.
+//!
 //! # Trust boundary
 //!
 //! The caller must trust the pre-commitment as a valid ordered Current database and
@@ -170,6 +177,7 @@ mod bitmap;
 #[cfg(feature = "std")]
 mod builder;
 mod bundle;
+mod codec;
 mod commitment;
 mod error;
 mod floor;
@@ -191,6 +199,7 @@ pub use bundle::{
     PreStateExclusionClaim, PreStateKeyClaim, PreStateMemberClaim, PreStateOpeningClaim,
     PreStateTerminalClaim,
 };
+pub use codec::{BundleConfig, BundleConfigFor};
 pub use commitment::{CurrentCommitment, initial_commitment};
 #[cfg(feature = "std")]
 pub use error::BuildError;
