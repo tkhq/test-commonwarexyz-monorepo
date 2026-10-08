@@ -325,6 +325,7 @@
 //! is computed. [proof::OpsRootWitness] can be used to validate that a particular ops root is
 //! committed by a trusted canonical root; the sync engine does not perform this check itself.
 
+#[cfg(feature = "std")]
 use crate::{
     Context,
     index::Factory as IndexFactory,
@@ -342,28 +343,43 @@ use crate::{
     },
     translator::Translator,
 };
+#[cfg(feature = "std")]
 use commonware_codec::{Codec, FixedSize};
+#[cfg(feature = "std")]
 use commonware_cryptography::Hasher;
+#[cfg(feature = "std")]
 use commonware_macros::boxed;
+#[cfg(feature = "std")]
 use commonware_parallel::Strategy;
+#[cfg(feature = "std")]
 use commonware_runtime::Spawner;
+#[cfg(feature = "std")]
 use commonware_utils::bitmap::Prunable as BitMap;
+#[cfg(feature = "std")]
 use core::num::NonZeroUsize;
+#[cfg(feature = "std")]
 use std::sync::Arc;
 
+#[cfg(feature = "std")]
 pub mod batch;
+#[cfg(feature = "std")]
 pub mod db;
 pub mod grafting;
 
 pub mod ordered;
 pub mod proof;
+mod roots;
+#[cfg(feature = "std")]
 pub(crate) mod sync;
+#[cfg(feature = "std")]
 pub mod unordered;
 
+#[cfg(feature = "std")]
 use self::db::Metrics;
 
 /// Configuration for a `Current` authenticated db.
 #[derive(Clone)]
+#[cfg(feature = "std")]
 pub struct Config<T: Translator, J, S: Strategy, B = ()> {
     /// Configuration for the Merkle structure backing the authenticated journal.
     pub merkle_config: MerkleConfig<S>,
@@ -393,6 +409,7 @@ pub struct Config<T: Translator, J, S: Strategy, B = ()> {
     pub init_concurrency: B,
 }
 
+#[cfg(feature = "std")]
 impl<T: Translator, J, S: Strategy, B> From<Config<T, J, S, B>> for AnyConfig<T, J, S, B> {
     fn from(cfg: Config<T, J, S, B>) -> Self {
         Self {
@@ -407,12 +424,15 @@ impl<T: Translator, J, S: Strategy, B> From<Config<T, J, S, B>> for AnyConfig<T,
 }
 
 /// Configuration for a `Current` authenticated db with fixed-size values.
+#[cfg(feature = "std")]
 pub type FixedConfig<T, S, B = ()> = Config<T, FConfig, S, B>;
 
 /// Configuration for a `Current` authenticated db with variable-sized values.
+#[cfg(feature = "std")]
 pub type VariableConfig<T, C, S, B = ()> = Config<T, VConfig<C>, S, B>;
 
 /// Initialize a `Current` authenticated db from the given config.
+#[cfg(feature = "std")]
 #[boxed]
 pub(super) async fn init<F, E, U, H, I, J, const N: usize, S>(
     context: E,
@@ -498,6 +518,7 @@ where
 
 /// Extension trait for Current QMDB types that exposes bitmap information for testing.
 #[cfg(any(test, feature = "test-traits"))]
+#[cfg(feature = "std")]
 pub trait BitmapPrunedBits {
     /// Returns the number of bits that have been pruned from the bitmap.
     fn pruned_bits(&self) -> u64;
@@ -510,6 +531,7 @@ pub trait BitmapPrunedBits {
 }
 
 #[cfg(test)]
+#[cfg(feature = "std")]
 pub mod tests {
     //! Shared test utilities for Current QMDB variants.
 

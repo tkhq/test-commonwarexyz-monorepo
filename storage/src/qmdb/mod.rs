@@ -76,55 +76,73 @@
 //! * [Merkle Mountain
 //!   Ranges](https://github.com/opentimestamps/opentimestamps-server/blob/master/doc/merkle-mountain-range.md)
 
+#[cfg(feature = "std")]
 use crate::{
     index::{
         Cursor, Unordered as Index,
         partitioned::{PartitionRange, Partitioned},
     },
     journal::{Error as JournalError, contiguous::Contiguous},
-    merkle::{
-        Bagging, Family, Location,
-        hasher::{Hasher as MerkleHasher, Standard as StandardHasher},
-    },
+    merkle::{Family, Location},
     qmdb::operation::{Floored, Operation},
     translator::Translator,
 };
+#[cfg(feature = "std")]
 use cache::Cache;
-use commonware_codec::Encode;
+#[cfg(feature = "std")]
 use commonware_cryptography::Hasher;
+#[cfg(feature = "std")]
 use commonware_runtime::{AbortOnDrop, ReadOptions, Spawner};
+#[cfg(feature = "std")]
 use commonware_utils::{
     bitmap::{Atomic, BitMap},
     channel::mpsc,
     prefetch::Lookahead,
 };
+#[cfg(feature = "std")]
 use core::{num::NonZeroUsize, ops::Range};
+#[cfg(feature = "std")]
 use futures::{StreamExt as _, pin_mut};
+#[cfg(feature = "std")]
 use std::{collections::VecDeque, sync::Arc};
+#[cfg(feature = "std")]
 use thiserror::Error;
 
 pub mod any;
+#[cfg(feature = "std")]
 pub(crate) mod bitmap;
+#[cfg(feature = "std")]
 mod cache;
+#[cfg(feature = "std")]
 pub mod chain;
+#[cfg(feature = "std")]
 pub(crate) mod compact;
 #[cfg(test)]
+#[cfg(feature = "std")]
 mod conformance;
 pub mod current;
 pub mod floor;
+#[cfg(feature = "std")]
 pub mod immutable;
+#[cfg(feature = "std")]
 pub mod keyless;
+#[cfg(feature = "std")]
 mod metrics;
 pub mod operation;
+#[cfg(feature = "std")]
 pub mod store;
+#[cfg(feature = "std")]
 pub mod sync;
 pub mod verify;
 
+#[cfg(feature = "std")]
+pub use verify::{create_multi_proof, create_proof_store};
 pub use verify::{
-    create_multi_proof, create_proof_store, verify_multi_proof, verify_proof,
-    verify_proof_and_extract_digests, verify_proof_and_pinned_nodes,
+    verify_multi_proof, verify_proof, verify_proof_and_extract_digests,
+    verify_proof_and_pinned_nodes,
 };
 
+#[cfg(feature = "std")]
 /// Reject a bound that cannot retain the bootstrap commit.
 pub(crate) fn validate_initialization_bound<F: Family>(
     bound: Option<Location<F>>,
@@ -135,6 +153,7 @@ pub(crate) fn validate_initialization_bound<F: Family>(
     Ok(())
 }
 
+#[cfg(feature = "std")]
 /// Validate a selected commit against its retained history and return its floor.
 fn validate_initialization_commit<F: Family>(
     start: u64,
@@ -166,6 +185,7 @@ fn validate_initialization_commit<F: Family>(
     Ok(Some(floor))
 }
 
+#[cfg(feature = "std")]
 /// Check the selected commit before recovery discards history. Rebuilding a snapshot from its floor
 /// additionally requires retaining that floor. Keyless only restores commit fields.
 pub(crate) async fn validate_initialization<F, E, C, H, S>(
@@ -194,6 +214,7 @@ where
     )
 }
 
+#[cfg(feature = "std")]
 /// Select a QMDB commit before validating variant-specific reconstruction state.
 pub(crate) async fn prepare_initialization<F, E, C, H, S>(
     context: E,
@@ -220,6 +241,7 @@ where
     .await?)
 }
 
+#[cfg(feature = "std")]
 /// Publish a standard QMDB journal after validating the retained commit.
 #[commonware_macros::boxed]
 pub(crate) async fn init_journal<F, E, C, H, S>(
@@ -241,28 +263,11 @@ where
     Ok(pending.finish().await?)
 }
 
-/// Merkle peak bagging policy used by QMDB operation roots.
-pub(crate) const ROOT_BAGGING: Bagging = Bagging::BackwardFold;
-
-/// Return the Merkle hasher configuration used by QMDB operation roots and proofs.
-pub const fn hasher<H: Hasher>() -> StandardHasher<H> {
-    StandardHasher::new(ROOT_BAGGING)
-}
-
-/// Return the root of an operation log containing only `operation`.
-///
-/// This lets database variants derive their initial root from the bootstrap commit without
-/// opening a database.
-fn single_operation_root<F: Family, H: Hasher>(operation: &impl Encode) -> H::Digest {
-    let hasher = hasher::<H>();
-    let leaf = MerkleHasher::<F>::leaf_digest(
-        &hasher,
-        F::location_to_position(Location::new(0)),
-        &operation.encode(),
-    );
-    MerkleHasher::<F>::root(&hasher, Location::new(1), 0, [&leaf])
-        .expect("a single-leaf Merkle root is always valid")
-}
+mod hash;
+#[cfg(feature = "std")]
+pub(crate) use hash::ROOT_BAGGING;
+pub use hash::hasher;
+use hash::single_operation_root;
 
 /// Look up the inactivity floor declared at the commit immediately preceding `op_count`.
 ///
@@ -276,6 +281,7 @@ fn single_operation_root<F: Family, H: Hasher>(operation: &impl Encode) -> H::Di
 ///   non-commit-boundary size, or because pruning removed the commit that would have governed this
 ///   size).
 /// - [`JournalError::ItemPruned`] if `op_count - 1` precedes the oldest retained location.
+#[cfg(feature = "std")]
 pub(crate) async fn find_inactivity_floor_at<F, R>(
     reader: &R,
     op_count: Location<F>,
@@ -306,6 +312,7 @@ where
 }
 
 /// Compute the inactive peak count for a historical operation count.
+#[cfg(feature = "std")]
 pub(crate) async fn inactive_peaks_at<F, R>(
     reader: &R,
     op_count: Location<F>,
@@ -324,6 +331,7 @@ where
 
 /// Errors that can occur when interacting with an authenticated database.
 #[derive(Error, Debug)]
+#[cfg(feature = "std")]
 pub enum Error<F: Family> {
     /// A QMDB initialization bound cannot exclude its initial commit.
     #[error("initialization bound must allow at least one operation")]
@@ -415,6 +423,7 @@ pub enum Error<F: Family> {
     HistoricalFloorPruned(Location<F>),
 }
 
+#[cfg(feature = "std")]
 impl<F: Family> From<crate::journal::authenticated::Error<F>> for Error<F> {
     fn from(e: crate::journal::authenticated::Error<F>) -> Self {
         match e {
@@ -433,6 +442,7 @@ impl<F: Family> From<crate::journal::authenticated::Error<F>> for Error<F> {
 /// `init_buffer` sizes the replay read buffer (in bytes). `cache_size` bounds a
 /// `(location -> key)` cache that lets collision resolution resolve candidates from memory
 /// instead of re-reading the log; `None` disables it.
+#[cfg(feature = "std")]
 pub(super) async fn build_snapshot_from_log<F, C, I, Fn>(
     inactivity_floor_loc: crate::merkle::Location<F>,
     reader: &C,
@@ -501,6 +511,7 @@ where
 
 /// Delete `key` from the snapshot if it exists, using a stable log reader, and return the
 /// previously associated location.
+#[cfg(feature = "std")]
 async fn delete_key<F, I, R>(
     snapshot: &mut I,
     reader: &R,
@@ -523,6 +534,7 @@ where
 /// Delete `key` at `cursor` (obtained from a `get_mut` lookup of `key`), returning its location if
 /// it was present among the cursor's conflicts. When supplied, the matched location is removed
 /// from `cache` with the snapshot deletion.
+#[cfg(feature = "std")]
 async fn delete_at_cursor<F, C, R>(
     mut cursor: C,
     reader: &R,
@@ -552,6 +564,7 @@ where
 }
 
 /// Update `key` in the snapshot using a stable log reader, returning its old location if present.
+#[cfg(feature = "std")]
 async fn update_key<F, I, R>(
     snapshot: &mut I,
     reader: &R,
@@ -577,6 +590,7 @@ where
 /// returning its old location if it was present among the cursor's conflicts; otherwise `new_loc`
 /// is inserted at the cursor. When supplied, the matched old location is removed from `cache` with
 /// the snapshot update.
+#[cfg(feature = "std")]
 async fn update_at_cursor<F, C, R>(
     mut cursor: C,
     reader: &R,
@@ -612,6 +626,7 @@ where
 
 /// Find and return the location of the update operation for `key`, if it exists. The cursor is
 /// positioned at the matching location, and can be used to update or delete the key.
+#[cfg(feature = "std")]
 async fn find_update_op<F, R>(
     reader: &R,
     cursor: &mut impl Cursor<Value = Location<F>>,
@@ -649,13 +664,16 @@ where
 
 /// Bounded depth (in batches) of each per-worker channel during a parallel build. Backpressure keeps
 /// the replay from running arbitrarily far ahead of a slow worker.
+#[cfg(feature = "std")]
 const SNAPSHOT_CHANNEL_DEPTH: usize = 4;
 
 /// A batch of keyed operations routed to a snapshot-build worker: each entry is the op's key, its
 /// location, and whether it is a delete.
+#[cfg(feature = "std")]
 type RoutedBatch<K> = Vec<(K, u64, bool)>;
 
 /// Parameters shared by the inline replay and decode chunks of one parallel build.
+#[cfg(feature = "std")]
 #[derive(Clone, Copy)]
 struct SnapshotRouting {
     /// Number of insert workers routed to.
@@ -671,17 +689,17 @@ struct SnapshotRouting {
 /// Number of operations the snapshot replay batches per worker-channel send during a parallel
 /// build. Build throughput is mostly insensitive to this value, so it is a constant rather than
 /// configuration. Small in tests so ordinary logs exercise batch boundaries.
-#[cfg(not(test))]
+#[cfg(all(feature = "std", not(test)))]
 const SNAPSHOT_ROUTE_BATCH: usize = 4096;
-#[cfg(test)]
+#[cfg(all(feature = "std", test))]
 const SNAPSHOT_ROUTE_BATCH: usize = 3;
 
 /// Operations ahead of its insert at which a parallel-build worker hints an operation's partition
 /// entries. The partition's header is hinted twice as far ahead. One in tests, so the hints reach
 /// their steady state within a [SNAPSHOT_ROUTE_BATCH].
-#[cfg(not(test))]
+#[cfg(all(feature = "std", not(test)))]
 const PREFETCH_DISTANCE: usize = 16;
-#[cfg(test)]
+#[cfg(all(feature = "std", test))]
 const PREFETCH_DISTANCE: usize = 1;
 
 /// Operations per decode chunk in a parallel build. Decoding the replay stream is the build's
@@ -689,9 +707,9 @@ const PREFETCH_DISTANCE: usize = 1;
 /// partition-routed) on concurrent tasks while the coordinator forwards finished chunks in position
 /// order. Together with the decoder count, this bounds the queued operations. Each decoder also
 /// reserves one batch per worker. Small in tests so ordinary logs exercise chunk boundaries.
-#[cfg(not(test))]
+#[cfg(all(feature = "std", not(test)))]
 const SNAPSHOT_DECODE_CHUNK: u64 = 1 << 17;
-#[cfg(test)]
+#[cfg(all(feature = "std", test))]
 const SNAPSHOT_DECODE_CHUNK: u64 = 64;
 
 /// Replay `range` and send each worker's keyed operations in log order, in batches of at most
@@ -699,6 +717,7 @@ const SNAPSHOT_DECODE_CHUNK: u64 = 64;
 ///
 /// Stop if `send` returns false. The caller owns the receiving tasks and observes their errors when
 /// joining them.
+#[cfg(feature = "std")]
 async fn route_snapshot<F, C, Fut>(
     log: &C,
     range: Range<u64>,
@@ -749,6 +768,7 @@ where
 /// `reader` and `(location -> key)` cache. Sets the bits of the range's active locations in the
 /// shared `active` bitmap (indexed over `activity`, the replayed region) and returns the populated
 /// worker index along with the range's active-key count.
+#[cfg(feature = "std")]
 async fn build_snapshot_worker<F, C, R>(
     log: Arc<C>,
     mut rx: mpsc::Receiver<RoutedBatch<<C::Item as Operation<F>>::Key>>,
@@ -828,6 +848,7 @@ where
 /// Build a snapshot serially on the calling task via [build_snapshot_from_log], collecting each
 /// replayed location's activity status into a [BitMap]. Returns the number of active keys and the
 /// activity bitmap (see [SnapshotBuild::build_snapshot]).
+#[cfg(feature = "std")]
 async fn build_snapshot_serial<F, C, I>(
     inactivity_floor_loc: Location<F>,
     reader: &C,
@@ -865,6 +886,7 @@ where
 /// and routing each keyed operation to the parallel insert worker owning its partition range
 /// (see [Partitioned]). Returns the number of active keys and the activity bitmap (see
 /// [SnapshotBuild::build_snapshot]).
+#[cfg(feature = "std")]
 async fn build_snapshot_parallel<F, E, C, I>(
     snapshot: &mut I,
     context: E,
@@ -1083,6 +1105,7 @@ where
 /// Sealed: only in-crate index types implement this, so internal invariants (e.g. builds must
 /// drop every clone of the shared log before returning) are enforced by the implementations
 /// rather than the public contract.
+#[cfg(feature = "std")]
 pub trait SnapshotBuild<F: Family>:
     sealed::SnapshotBuildSealed + Index<Value = Location<F>> + Sized + 'static
 {
@@ -1115,6 +1138,7 @@ pub trait SnapshotBuild<F: Family>:
     }
 }
 
+#[cfg(feature = "std")]
 mod sealed {
     use crate::translator::Translator;
 
@@ -1131,13 +1155,16 @@ mod sealed {
     }
 }
 
+#[cfg(feature = "std")]
 impl<F: Family, T: Translator> SnapshotBuild<F> for crate::index::unordered::Index<T, Location<F>> {
     type Concurrency = ();
 }
+#[cfg(feature = "std")]
 impl<F: Family, T: Translator> SnapshotBuild<F> for crate::index::ordered::Index<T, Location<F>> {
     type Concurrency = ();
 }
 
+#[cfg(feature = "std")]
 impl<F: Family, T: Translator, const P: usize> SnapshotBuild<F>
     for crate::index::partitioned::unordered::Index<T, Location<F>, P>
 {
@@ -1169,6 +1196,7 @@ impl<F: Family, T: Translator, const P: usize> SnapshotBuild<F>
     }
 }
 
+#[cfg(feature = "std")]
 impl<F: Family, T: Translator, const P: usize> SnapshotBuild<F>
     for crate::index::partitioned::ordered::Index<T, Location<F>, P>
 {
@@ -1206,6 +1234,7 @@ impl<F: Family, T: Translator, const P: usize> SnapshotBuild<F>
 /// # Panics
 ///
 /// Panics if `key` is not found in the snapshot or if `old_loc` is not found in the cursor.
+#[cfg(feature = "std")]
 fn update_known_loc<F: Family, I: Index<Value = Location<F>>>(
     snapshot: &mut I,
     key: &[u8],
@@ -1226,6 +1255,7 @@ fn update_known_loc<F: Family, I: Index<Value = Location<F>>>(
 /// # Panics
 ///
 /// Panics if `key` is not found in the snapshot or if `old_loc` is not found in the cursor.
+#[cfg(feature = "std")]
 fn delete_known_loc<F: Family, I: Index<Value = Location<F>>>(
     snapshot: &mut I,
     key: &[u8],

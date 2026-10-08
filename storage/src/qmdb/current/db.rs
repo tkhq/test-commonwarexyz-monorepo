@@ -916,50 +916,6 @@ pub(super) fn pending_chunk<F: merkle::Graftable, B: bitmap::Readable<N>, const 
     Ok(Some(bitmap.get_chunk(graftable as usize)))
 }
 
-/// Compute the canonical root from the ops root, grafted tree root, and optional pending /
-/// partial chunk digests.
-///
-/// See [Canonical root structure](super::proof#canonical-root-structure) for the full layout.
-/// The pending and partial inputs are independent: either, both, or neither may be set, and
-/// pending precedes partial in hash order when both are present.
-///
-/// # Collision resistance
-///
-/// `pending` contributes `D` bytes when present; `partial` contributes `D + 8` bytes (`D` =
-/// digest size). Different fixed lengths, so the two cannot produce the same input bytes,
-/// even when their digests are identical. Collisions reduce to H.
-pub(super) fn combine_roots<H: Hasher>(
-    ops_root: &H::Digest,
-    grafted_root: &H::Digest,
-    pending: Option<&H::Digest>,
-    partial: Option<(u64, &H::Digest)>,
-) -> H::Digest {
-    let hasher = qmdb::hasher::<H>();
-    match (pending, partial) {
-        (None, None) => hasher.hash(&[ops_root.as_ref(), grafted_root.as_ref()]),
-        (Some(pe), None) => hasher.hash(&[ops_root.as_ref(), grafted_root.as_ref(), pe.as_ref()]),
-        (None, Some((nb, p))) => {
-            let nb_bytes = nb.to_be_bytes();
-            hasher.hash(&[
-                ops_root.as_ref(),
-                grafted_root.as_ref(),
-                nb_bytes.as_slice(),
-                p.as_ref(),
-            ])
-        }
-        (Some(pe), Some((nb, p))) => {
-            let nb_bytes = nb.to_be_bytes();
-            hasher.hash(&[
-                ops_root.as_ref(),
-                grafted_root.as_ref(),
-                pe.as_ref(),
-                nb_bytes.as_slice(),
-                p.as_ref(),
-            ])
-        }
-    }
-}
-
 /// Gather the components that bind an ops root to a canonical [Db] root.
 ///
 /// See the [Root structure](super) section in the module documentation.
@@ -1035,7 +991,7 @@ where
 ///
 /// Only **graftable** chunks (those whose h=G ancestor has been born in the ops tree) are
 /// committed by the grafted tree. The most recently completed but ungraftable chunk, if
-/// any, is hashed into the canonical root directly by [`combine_roots`] as the pending
+/// any, is hashed into the canonical root directly by [`combine_roots`](super::roots::combine_roots) as the pending
 /// chunk, not by this function.
 ///
 /// `ops_leaves` must come from the same single snapshot as `status` to preserve the
@@ -1260,7 +1216,7 @@ mod tests {
                 test::{Choice, Inspect as _, Script},
                 traits::{DbAny, UnmerkleizedBatch as _},
             },
-            current::{tests::fixed_config, unordered::fixed},
+            current::{roots::combine_roots, tests::fixed_config, unordered::fixed},
             floor::Proportional,
         },
         translator::OneCap,
