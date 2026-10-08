@@ -170,3 +170,12 @@ path = "src/metadata/benches/bench.rs"
 name="rmap"
 harness = false
 path = "src/rmap/benches/bench.rs"
+
+[[bench]]
+name="stateless_verifier"
+harness = false
+path = "src/qmdb/current/verifier/benches/bench.rs"
+
+[[example]]
+name = "stateless"
+required-features = ["std"]
