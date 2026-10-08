@@ -2,6 +2,31 @@
 
 use thiserror::Error;
 
+/// Failure to construct a transition proof from a committed database.
+#[derive(Debug, Error)]
+#[cfg(feature = "std")]
+pub enum BuildError<F: crate::merkle::Family> {
+    /// Storage could not supply the required records or Merkle nodes.
+    #[error("database proof construction failed: {0}")]
+    Database(#[from] crate::qmdb::Error<F>),
+    /// The database did not satisfy the committed-state contract.
+    #[error("invalid committed database state: {0}")]
+    InvalidState(&'static str),
+    /// The floor policy evicts or limits skips, which a verifier cannot replay.
+    #[error("unsupported floor policy")]
+    UnsupportedFloorPolicy,
+    /// Generated evidence failed the verifier's checks.
+    #[error("generated proof is inconsistent: {0}")]
+    Inconsistent(#[from] VerifyError),
+}
+
+#[cfg(feature = "std")]
+impl<F: crate::merkle::Family> From<crate::merkle::Error<F>> for BuildError<F> {
+    fn from(error: crate::merkle::Error<F>) -> Self {
+        Self::Database(crate::qmdb::Error::Merkle(error))
+    }
+}
+
 /// A pre-state fact needed to derive the ordered transition has not been established.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum InsufficientPreState {
