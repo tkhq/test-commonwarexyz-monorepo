@@ -117,6 +117,7 @@
 //! let db = db.apply_batch(merkleized).await?;
 //! ```
 
+#[cfg(feature = "std")]
 use crate::{
     Context,
     index::Factory as IndexFactory,
@@ -124,34 +125,46 @@ use crate::{
         authenticated,
         contiguous::{fixed::Config as FConfig, variable::Config as VConfig},
     },
-    merkle::{Family, Location, full::Config as MerkleConfig},
-    qmdb::{
-        Error as QmdbError,
-        any::operation::{Operation, Update},
-        bitmap::Shared,
-        metrics::Metrics,
-        single_operation_root,
-    },
+    merkle::full::Config as MerkleConfig,
+    qmdb::{Error as QmdbError, bitmap::Shared, metrics::Metrics},
     translator::Translator,
 };
+use crate::{
+    merkle::{Family, Location},
+    qmdb::single_operation_root,
+};
+#[cfg(feature = "std")]
 use commonware_codec::Codec;
+use commonware_codec::Encode;
 use commonware_cryptography::Hasher;
+#[cfg(feature = "std")]
 use commonware_macros::boxed;
+#[cfg(feature = "std")]
 use commonware_parallel::Strategy;
+#[cfg(feature = "std")]
 use commonware_runtime::Spawner;
+#[cfg(feature = "std")]
 use core::num::NonZeroUsize;
+use operation::{Operation, Update};
+#[cfg(feature = "std")]
 use std::sync::Arc;
+#[cfg(feature = "std")]
 use tracing::warn;
 
+#[cfg(feature = "std")]
 pub mod batch;
+#[cfg(feature = "std")]
 pub mod db;
 pub mod operation;
 #[cfg(any(test, feature = "test-traits"))]
+#[cfg(feature = "std")]
 pub mod traits;
 pub mod value;
 pub use value::{FixedValue, ValueEncoding, VariableValue};
 pub mod ordered;
+#[cfg(feature = "std")]
 pub(crate) mod sync;
+#[cfg(feature = "std")]
 pub mod unordered;
 
 /// Compute the authenticated root of a newly initialized database without opening storage.
@@ -163,15 +176,17 @@ where
     F: Family,
     H: Hasher,
     U: Update,
-    Operation<F, U>: Codec,
+    Operation<F, U>: Encode,
 {
     single_operation_root::<F, H>(&Operation::<F, U>::CommitFloor(None, Location::new(0)))
 }
 
+#[cfg(feature = "std")]
 pub(crate) const BITMAP_CHUNK_BYTES: usize = 64;
 
 /// Configuration for an `Any` authenticated db.
 #[derive(Clone)]
+#[cfg(feature = "std")]
 pub struct Config<T: Translator, J, S: Strategy, B = ()> {
     /// Configuration for the Merkle structure backing the authenticated journal.
     pub merkle_config: MerkleConfig<S>,
@@ -198,9 +213,11 @@ pub struct Config<T: Translator, J, S: Strategy, B = ()> {
 }
 
 /// Configuration for an `Any` authenticated db with fixed-size values.
+#[cfg(feature = "std")]
 pub type FixedConfig<T, S, B = ()> = Config<T, FConfig, S, B>;
 
 /// Configuration for an `Any` authenticated db with variable-sized values.
+#[cfg(feature = "std")]
 pub type VariableConfig<T, C, S, B = ()> = Config<T, VConfig<C>, S, B>;
 
 /// Initialize an `Any` authenticated db from the given config.
@@ -209,6 +226,7 @@ pub type VariableConfig<T, C, S, B = ()> = Config<T, VConfig<C>, S, B>;
 ///
 /// The selected state is durable before return. Zero is invalid because the initial commit
 /// requires one operation. Subsequent appends may exceed this initialization bound.
+#[cfg(feature = "std")]
 pub async fn init<F, E, U, H, I, J, S>(
     context: E,
     cfg: Config<I::Translator, J::Config, S, <I as crate::qmdb::SnapshotBuild<F>>::Concurrency>,
@@ -230,6 +248,7 @@ where
 
 /// Like [`init`] but accepts a pre-allocated bitmap (used by `current::Db`, which sizes pruned
 /// chunks from grafted metadata). `bitmap = None` allocates internally.
+#[cfg(feature = "std")]
 #[boxed]
 pub(crate) async fn init_with_bitmap<F, E, U, H, I, J, S, const N: usize>(
     context: E,
@@ -306,6 +325,7 @@ where
 
 #[cfg(test)]
 // pub(crate) so qmdb/current can use the generic tests.
+#[cfg(feature = "std")]
 pub(crate) mod test {
     use super::*;
     use crate::{
@@ -320,7 +340,7 @@ pub(crate) mod test {
         },
         translator::OneCap,
     };
-    use commonware_codec::{Codec, CodecShared, Encode as _};
+    use commonware_codec::{Codec, CodecShared};
     use commonware_cryptography::{Hasher, Sha256, sha256::Digest};
     use commonware_runtime::{Supervisor as _, buffer::paged::CacheRef, deterministic::Context};
     use commonware_utils::{
@@ -7429,6 +7449,7 @@ pub(crate) mod test {
 }
 
 #[cfg(test)]
+#[cfg(feature = "std")]
 mod bitmap_tests {
     //! Regression tests for activity-bitmap maintenance in `any::Db`. The mutation code in
     //! `apply_batch`, `prune_bitmap`, and initialization is independent of the snapshot index

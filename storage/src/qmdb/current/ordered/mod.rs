@@ -8,11 +8,14 @@
 //! - [fixed]: Variant optimized for values of fixed size.
 //! - [variable]: Variant for values of variable size.
 
+#[cfg(feature = "std")]
 pub mod db;
+#[cfg(feature = "std")]
 pub mod fixed;
 pub mod proof;
-#[cfg(any(test, feature = "test-traits"))]
+#[cfg(all(feature = "std", any(test, feature = "test-traits")))]
 mod test_trait_impls;
+#[cfg(feature = "std")]
 pub mod variable;
 
 /// Wire tag for [proof::constant::ExclusionProof::KeyValue].
@@ -22,6 +25,7 @@ pub const KEY_VALUE_CONTEXT: u8 = 0;
 pub const COMMIT_CONTEXT: u8 = 1;
 
 #[cfg(test)]
+#[cfg(feature = "std")]
 pub mod tests {
     //! Shared test utilities for ordered Current QMDB variants.
 

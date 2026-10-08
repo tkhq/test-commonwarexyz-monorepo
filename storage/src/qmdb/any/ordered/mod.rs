@@ -1,3 +1,4 @@
+#[cfg(feature = "std")]
 use crate::{
     Context,
     index::Ordered as Index,
@@ -8,10 +9,15 @@ use crate::{
         operation::{Key, Operation as OperationTrait},
     },
 };
+#[cfg(feature = "std")]
 use commonware_codec::Codec;
+#[cfg(feature = "std")]
 use commonware_cryptography::Hasher;
+#[cfg(feature = "std")]
 use commonware_parallel::Strategy;
+#[cfg(feature = "std")]
 use commonware_utils::range::contains_cyclic;
+#[cfg(feature = "std")]
 use core::{
     future::Future,
     mem,
@@ -20,20 +26,21 @@ use core::{
         RangeBounds,
     },
 };
+#[cfg(feature = "std")]
 use futures::{
     TryStreamExt as _,
     future::try_join_all,
     stream::{self, Stream},
 };
 
+#[cfg(feature = "std")]
 pub mod fixed;
+#[cfg(feature = "std")]
 pub mod variable;
 
 pub use crate::qmdb::any::operation::{Ordered as Operation, update::Ordered as Update};
 
-/// Type alias for a location and its associated key data.
-type LocatedKey<F, K, V> = Option<(Location<F>, Update<K, V>)>;
-
+#[cfg(feature = "std")]
 /// Which collision bucket a range scan fetches next.
 enum Cursor<K> {
     /// The lower bound's bucket.
@@ -44,6 +51,7 @@ enum Cursor<K> {
     Done,
 }
 
+#[cfg(feature = "std")]
 /// Whether `key` lies beyond the range's upper bound.
 fn past_end<K: Ord>(end: Bound<&K>, key: &K) -> bool {
     match end {
@@ -53,6 +61,11 @@ fn past_end<K: Ord>(end: Bound<&K>, key: &K) -> bool {
     }
 }
 
+/// Type alias for a location and its associated key data.
+#[cfg(feature = "std")]
+type LocatedKey<F, K, V> = Option<(Location<F>, Update<K, V>)>;
+
+#[cfg(feature = "std")]
 impl<
     F: Family,
     E: Context,
@@ -331,6 +344,7 @@ where
     }
 }
 
+#[cfg(feature = "std")]
 /// The keys around a batch's writes: the candidates for the successor of each written key, and
 /// the candidates for the predecessor of each key that joins or leaves the key set, each with the
 /// source its rewrite takes.
@@ -345,6 +359,7 @@ pub(crate) struct Neighbors<K, S> {
     pub(crate) prev: Vec<(K, Option<S>)>,
 }
 
+#[cfg(feature = "std")]
 impl<K: Key, S: Send> Neighbors<K, S> {
     pub(crate) const fn new() -> Self {
         Self {
@@ -398,6 +413,7 @@ impl<K: Key, S: Send> Neighbors<K, S> {
 /// # Panics
 ///
 /// Panics if `possible_next` is empty.
+#[cfg(feature = "std")]
 fn find_next_key<K: Ord + Clone>(key: &K, possible_next: &[K]) -> K {
     let idx = possible_next.partition_point(|k| k <= key);
     if idx < possible_next.len() {
@@ -417,6 +433,7 @@ fn find_next_key<K: Ord + Clone>(key: &K, possible_next: &[K]) -> K {
 ///
 /// Panics if `possible_next` is empty, or on any out-of-order query that would return a
 /// wrong result (`idx` has already advanced past a candidate above the query).
+#[cfg(feature = "std")]
 pub(crate) fn find_next_key_ascending<K: Ord + Clone>(
     key: &K,
     possible_next: &[K],
@@ -445,6 +462,7 @@ pub(crate) fn find_next_key_ascending<K: Ord + Clone>(
 /// # Panics
 ///
 /// Panics if `possible_previous` is empty.
+#[cfg(feature = "std")]
 fn find_prev_key_mut<'a, K: Ord, V>(
     key: &K,
     possible_previous: &'a mut [(K, V)],
@@ -460,7 +478,7 @@ fn find_prev_key_mut<'a, K: Ord, V>(
     (k, v)
 }
 
-#[cfg(any(test, feature = "test-traits"))]
+#[cfg(all(feature = "std", any(test, feature = "test-traits")))]
 crate::qmdb::any::traits::impl_db_any! {
     [F, E, K, V, C, I, H, const N: usize, S] Db<F, E, C, I, H, Update<K, V>, N, S>
     where {
@@ -478,7 +496,7 @@ crate::qmdb::any::traits::impl_db_any! {
     Family = F, Key = K, Value = V::Value, Digest = H::Digest
 }
 
-#[cfg(any(test, feature = "test-traits"))]
+#[cfg(all(feature = "std", any(test, feature = "test-traits")))]
 crate::qmdb::any::traits::impl_provable! {
     [F, E, K, V, C, I, H, const N: usize, S] Db<F, E, C, I, H, Update<K, V>, N, S>
     where {
@@ -497,6 +515,7 @@ crate::qmdb::any::traits::impl_provable! {
 }
 
 #[cfg(test)]
+#[cfg(feature = "std")]
 mod test {
     use super::*;
     use crate::{

@@ -1,6 +1,6 @@
 use crate::qmdb::{any::value::ValueEncoding, operation::Key};
 use commonware_codec::CodecShared;
-use std::fmt;
+use core::fmt;
 
 mod sealed {
     pub trait Sealed {}
@@ -52,6 +52,7 @@ pub trait Update: sealed::Sealed + Clone + Send + Sync + 'static {
 
 /// Splits an update into its owned key, value, and cached payload, rebuilds it from them, and
 /// states whether deleting a key involves its collision siblings.
+#[cfg_attr(not(feature = "std"), allow(dead_code))]
 pub(crate) trait Parts: Update {
     /// Whether a collision sibling can hold the predecessor link that deleting a key rewrites.
     const SIBLINGS: bool;
@@ -66,14 +67,11 @@ pub(crate) trait Parts: Update {
 
 #[cfg(test)]
 mod tests {
-    use super::ordered::Update as OrderedUpdate;
-    use crate::qmdb::any::{
-        unordered::Update as UnorderedUpdate,
-        value::{FixedEncoding, VariableEncoding},
-    };
+    use super::{ordered::Update as OrderedUpdate, unordered::Update as UnorderedUpdate};
+    use crate::qmdb::any::value::{FixedEncoding, VariableEncoding};
     use commonware_codec::{Codec, RangeCfg, Read};
     use commonware_utils::sequence::FixedBytes;
-    use std::fmt;
+    use core::fmt;
 
     fn roundtrip<T>(value: &T, cfg: &<T as Read>::Cfg)
     where

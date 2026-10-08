@@ -12,11 +12,11 @@ use crate::{
         operation::{commit_fixed_operation_size, read_commit_fixed, write_commit_fixed},
     },
 };
+use bytes::BufMut;
 use commonware_codec::{
     Buf, CodecFixed, Error as CodecError, FixedSize, ReadExt as _, Write,
     util::{at_least, ensure_zeros},
 };
-use commonware_runtime::BufMut;
 use commonware_utils::Array;
 
 /// `max(a, b)` in a const context.

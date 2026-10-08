@@ -1,11 +1,11 @@
 //! Shared traits and codecs for QMDB operations.
 
 use crate::merkle::{Family, Location};
+use bytes::BufMut;
 use commonware_codec::{
     Buf, CodecShared, EncodeSize, Error as CodecError, FixedSize, Read, ReadExt as _, Write,
     util::ensure_zeros,
 };
-use commonware_runtime::BufMut;
 use core::{fmt::Debug, hash::Hash, ops::Deref};
 
 /// Trait bound for key types used in QMDB operations. Satisfied by both fixed-size keys

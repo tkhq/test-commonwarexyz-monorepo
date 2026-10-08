@@ -9,13 +9,13 @@ use crate::qmdb::{
     },
     operation::Key,
 };
+use bytes::BufMut;
 use commonware_codec::{
     Buf, Encode as _, EncodeSize, Error as CodecError, FixedSize, Read, ReadExt as _, Write,
 };
 use commonware_formatting::hex;
-use commonware_runtime::BufMut;
 use commonware_utils::Array;
-use std::fmt;
+use core::fmt;
 
 #[derive(Clone, PartialEq, Debug, Eq)]
 pub struct Update<K: Key, V: ValueEncoding>(pub K, pub V::Value);
