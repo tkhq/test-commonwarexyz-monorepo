@@ -707,3 +707,293 @@ impl<K: Key, A: Clone> UserBatch<K, A> {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type Batch = UserBatch<u8, u8>;
+
+    /// What the last request covering a key does to it.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Effect {
+        Untouched,
+        Set(u8),
+        Deleted,
+    }
+
+    /// One edit; a set writes the step at which it is applied, so every set is distinct.
+    #[derive(Clone, Copy, Debug)]
+    enum Edit {
+        Set(u8),
+        Delete(u8),
+        DeleteRange(Bound<u8>, Bound<u8>),
+        Remove(u8),
+    }
+
+    const KEYS: u8 = 5;
+
+    fn effect(op: &UserOp<u8, u8>, key: u8) -> Option<Effect> {
+        match op {
+            UserOp::Set { key: set, value } => (*set == key).then_some(Effect::Set(*value)),
+            UserOp::Delete { key: deleted } => (*deleted == key).then_some(Effect::Deleted),
+            UserOp::DeleteRange { start, end } => {
+                range_contains(start, end, &key).then_some(Effect::Deleted)
+            }
+        }
+    }
+
+    fn effects(batch: &Batch, keys: u8) -> Vec<Effect> {
+        (0..keys)
+            .map(|key| {
+                batch
+                    .iter()
+                    .find_map(|op| effect(op, key))
+                    .unwrap_or(Effect::Untouched)
+            })
+            .collect()
+    }
+
+    /// Apply `edit` to the batch and to a model in which the last request covering a key wins.
+    fn apply(batch: &mut Batch, model: &mut [Effect], edit: Edit, step: u8) {
+        match edit {
+            Edit::Set(key) => {
+                batch.set(key, step);
+                model[usize::from(key)] = Effect::Set(step);
+            }
+            Edit::Delete(key) => {
+                batch.delete(key);
+                model[usize::from(key)] = Effect::Deleted;
+            }
+            Edit::DeleteRange(start, end) => {
+                let reversed = matches!((finite(&start), finite(&end)),
+                    (Some((start, _)), Some((end, _))) if start > end);
+                let before = batch.iter().cloned().collect::<Vec<_>>();
+                if batch.delete_range((start, end)).is_err() {
+                    assert!(reversed, "{edit:?} was refused");
+                    assert!(batch.iter().eq(before.iter()), "{edit:?} changed the batch");
+                    return;
+                }
+                assert!(!reversed, "{edit:?} was accepted");
+                for (key, slot) in (0..).zip(model.iter_mut()) {
+                    if (start, end).contains(&key) {
+                        *slot = Effect::Deleted;
+                    }
+                }
+            }
+            Edit::Remove(key) => {
+                // Removing an operation forgets its effect without restoring earlier requests.
+                let removed = batch.get(&key).cloned();
+                assert_eq!(batch.remove(&key), removed);
+                if let Some(op) = removed {
+                    for (covered, slot) in model.iter_mut().enumerate() {
+                        if effect(&op, covered as u8).is_some() {
+                            *slot = Effect::Untouched;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Operations are ordered and disjoint, every finite range spans two keys or more, and
+    /// delete coverage is joined wherever it can be: two deletes meet only at a key both
+    /// exclude. Only the first operation may start unbounded, and only the last may end so.
+    fn assert_normalized(batch: &Batch) {
+        let bounds = |op: &UserOp<u8, u8>| match op {
+            UserOp::Set { key, .. } | UserOp::Delete { key } => {
+                (Bound::Included(*key), Bound::Included(*key))
+            }
+            UserOp::DeleteRange { start, end } => (*start, *end),
+        };
+        for op in batch {
+            if let UserOp::DeleteRange { start, end } = op
+                && let (Some((start, _)), Some((end, _))) = (finite(start), finite(end))
+            {
+                assert!(start < end, "{op:?} is not a range");
+            }
+        }
+        for (before, after) in batch.iter().zip(batch.iter().skip(1)) {
+            let (end, start) = (bounds(before).1, bounds(after).0);
+            let (Some((end, end_included)), Some((start, start_included))) =
+                (finite(&end), finite(&start))
+            else {
+                panic!("{before:?} and {after:?} overlap");
+            };
+            let deletes = ![before, after]
+                .iter()
+                .any(|op| matches!(op, UserOp::Set { .. }));
+            let apart = match end.cmp(start) {
+                Ordering::Less => true,
+                Ordering::Equal if deletes => !end_included && !start_included,
+                Ordering::Equal => !end_included || !start_included,
+                Ordering::Greater => false,
+            };
+            assert!(apart, "{before:?} and {after:?} overlap or were not joined");
+        }
+    }
+
+    /// The batch matches the model, is normalized, and rebuilds from its own operations.
+    fn check(batch: &Batch, model: &[Effect], edits: &[Edit]) {
+        assert_eq!(effects(batch, KEYS), model, "after {edits:?}");
+        assert_normalized(batch);
+        let rebuilt = batch.iter().cloned().collect::<Batch>();
+        assert!(rebuilt.iter().eq(batch.iter()), "after {edits:?}");
+        assert_eq!(batch.len(), batch.iter().count());
+    }
+
+    /// Every point edit, every inclusive range, and every range open at one end or both.
+    /// Sets split ranges into the excluded bounds, so those are reached too.
+    fn all_edits() -> Vec<Edit> {
+        let mut edits = vec![Edit::DeleteRange(Bound::Unbounded, Bound::Unbounded)];
+        for key in 0..KEYS {
+            edits.extend([
+                Edit::Set(key),
+                Edit::Delete(key),
+                Edit::Remove(key),
+                Edit::DeleteRange(Bound::Unbounded, Bound::Included(key)),
+                Edit::DeleteRange(Bound::Included(key), Bound::Unbounded),
+            ]);
+            edits.extend(
+                (key..KEYS)
+                    .map(|end| Edit::DeleteRange(Bound::Included(key), Bound::Included(end))),
+            );
+        }
+        edits
+    }
+
+    #[test]
+    fn every_three_edits_match_a_last_write_wins_model() {
+        let edits = all_edits();
+        for &first in &edits {
+            for &second in &edits {
+                for &third in &edits {
+                    let sequence = [first, second, third];
+                    let mut batch = Batch::new();
+                    let mut model = [Effect::Untouched; KEYS as usize];
+                    for (step, edit) in sequence.into_iter().enumerate() {
+                        apply(&mut batch, &mut model, edit, step as u8);
+                        check(&batch, &model, &sequence[..=step]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_appended_batch_wins() {
+        let edits = all_edits();
+        for &first in &edits {
+            for &second in &edits {
+                for &other in &edits {
+                    let mut batch = Batch::new();
+                    let mut model = [Effect::Untouched; KEYS as usize];
+                    apply(&mut batch, &mut model, first, 0);
+                    apply(&mut batch, &mut model, second, 1);
+                    let mut appended = Batch::new();
+                    apply(
+                        &mut appended,
+                        &mut [Effect::Untouched; KEYS as usize],
+                        other,
+                        2,
+                    );
+                    for (slot, theirs) in model.iter_mut().zip(effects(&appended, KEYS)) {
+                        if theirs != Effect::Untouched {
+                            *slot = theirs;
+                        }
+                    }
+                    batch.append(&mut appended);
+                    assert!(appended.is_empty());
+                    check(&batch, &model, &[first, second, other]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn long_edit_sequences_match_the_model() {
+        const WIDE: u8 = 64;
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = |bound: u8| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % u64::from(bound)) as u8
+        };
+        // Any pair of bounds up to a dozen keys apart, so reversed and empty ranges arrive too.
+        // One side in eight is open.
+        let bound = |choice: u8, key: u8| match choice {
+            0 => Bound::Unbounded,
+            1..=3 => Bound::Excluded(key),
+            _ => Bound::Included(key),
+        };
+        let mut batch = Batch::new();
+        let mut model = [Effect::Untouched; WIDE as usize];
+        for step in 0..2_000u32 {
+            let key = next(WIDE);
+            let edit = match next(8) {
+                0..=2 => Edit::Set(key),
+                3 | 4 => Edit::Delete(key),
+                5 | 6 => {
+                    let end = key.saturating_add(next(14)).saturating_sub(1).min(WIDE - 1);
+                    Edit::DeleteRange(bound(next(8), key), bound(next(8), end))
+                }
+                _ => Edit::Remove(key),
+            };
+            apply(&mut batch, &mut model, edit, step as u8);
+            assert_eq!(effects(&batch, WIDE), model, "at step {step}");
+            assert_normalized(&batch);
+        }
+    }
+
+    #[test]
+    fn reversed_ranges_leave_the_batch_unchanged() {
+        let mut batch = Batch::from([UserOp::set(3, 1)]);
+        assert_eq!(
+            batch.delete_range((Bound::Included(5), Bound::Included(1))),
+            Err(VerifyError::InvalidBounds)
+        );
+        assert!(batch.iter().eq([UserOp::set(3, 1)].iter()));
+    }
+
+    /// A range that contains no key, empty or reversed, changes nothing, wherever it arrives.
+    #[test]
+    fn ranges_without_keys_change_nothing() {
+        let batch = Batch::from([
+            UserOp::set(3, 1),
+            UserOp::DeleteRange {
+                start: Bound::Excluded(3),
+                end: Bound::Excluded(3),
+            },
+            UserOp::delete_range(4..4),
+            UserOp::delete_range((Bound::Included(9), Bound::Included(5))),
+        ]);
+        assert!(batch.iter().eq([UserOp::set(3, 1)].iter()));
+    }
+
+    /// A set splits a range open at both ends into two open at one end each, and deleting the
+    /// key joins them again. Looking a key up finds only an operation starting there, not a
+    /// range covering it; a range open below is the first operation.
+    #[test]
+    fn open_ranges_split_and_join() {
+        let mut batch = Batch::from([UserOp::delete_range(..), UserOp::set(3, 1)]);
+        assert!(
+            batch.iter().eq([
+                UserOp::DeleteRange {
+                    start: Bound::Unbounded,
+                    end: Bound::Excluded(3),
+                },
+                UserOp::set(3, 1),
+                UserOp::DeleteRange {
+                    start: Bound::Excluded(3),
+                    end: Bound::Unbounded,
+                },
+            ]
+            .iter())
+        );
+        assert_eq!(batch.get(&0), None);
+        batch.delete(3);
+        assert!(batch.iter().eq([UserOp::delete_range(..)].iter()));
+        assert_eq!(batch.first().map(UserOp::start), Some(Bound::Unbounded));
+    }
+}

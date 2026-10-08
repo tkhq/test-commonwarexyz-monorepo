@@ -201,3 +201,82 @@ pub(crate) fn verify_multi_subtree_inclusion<F: Family, H: Hasher<F>>(
     }
     Ok(nodes)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        merkle::{Graftable, mmb, mmr},
+        qmdb::{self, current::grafting},
+    };
+    use commonware_cryptography::{Hasher as _, Sha256};
+
+    /// A block of `2^height` leaves is a node of the tree exactly when its index is below
+    /// `graftable_chunks` at that height, the rule the prover splits clear runs by: the plan
+    /// refuses every other block as a target before reading any digest.
+    fn targets_are_nodes_exactly_when_formed<F: Graftable>() {
+        let hasher = qmdb::hasher::<Sha256>();
+        let digest = Sha256::hash(&[b"target".as_slice()]);
+        for leaves in 1..=300u64 {
+            let proof = merkle::Proof::<F, _> {
+                leaves: Location::new(leaves),
+                inactive_peaks: 0,
+                digests: Vec::new(),
+            };
+            for height in 1..=6 {
+                let formed = grafting::graftable_chunks::<F>(leaves, height);
+                for block in 0..leaves >> height {
+                    let target = SubtreeTarget {
+                        leaf_start: Location::new(block << height),
+                        height,
+                        digest,
+                    };
+                    let result = verify_multi_subtree_inclusion(
+                        &proof,
+                        &hasher,
+                        &[target],
+                        &digest,
+                        BitmapFault::RawRoot,
+                    );
+                    let refused = result == Err(BitmapFault::Geometry.into());
+                    assert_eq!(
+                        refused,
+                        block >= formed,
+                        "block {block} of height {height} at {leaves} leaves"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mmr_targets_are_nodes_exactly_when_formed() {
+        targets_are_nodes_exactly_when_formed::<mmr::Family>();
+    }
+
+    #[test]
+    fn mmb_targets_are_nodes_exactly_when_formed() {
+        targets_are_nodes_exactly_when_formed::<mmb::Family>();
+    }
+
+    /// Targets past the last peak are refused rather than ignored.
+    #[test]
+    fn targets_past_the_tree_are_refused() {
+        let hasher = qmdb::hasher::<Sha256>();
+        let digest = Sha256::hash(&[b"target".as_slice()]);
+        let proof = merkle::Proof::<mmr::Family, _> {
+            leaves: Location::new(8),
+            inactive_peaks: 0,
+            digests: Vec::new(),
+        };
+        let past = SubtreeTarget {
+            leaf_start: Location::new(8),
+            height: 1,
+            digest,
+        };
+        assert_eq!(
+            verify_multi_subtree_inclusion(&proof, &hasher, &[past], &digest, BitmapFault::RawRoot),
+            Err(BitmapFault::Geometry.into())
+        );
+    }
+}

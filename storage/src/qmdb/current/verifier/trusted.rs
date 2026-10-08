@@ -616,3 +616,170 @@ where
         self.commitment = commitment;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{OptionTrusted::Unknown, *};
+    use crate::{merkle::mmr, qmdb::any::value::FixedEncoding};
+    use alloc::vec;
+    use commonware_cryptography::Sha256;
+    use commonware_utils::sequence::FixedBytes;
+
+    type F = mmr::Family;
+    type Key = FixedBytes<8>;
+    type State = PartialTrustedState<F, Key, Key>;
+    type Map = TrustedMap<F, Key, FixedEncoding<Key>, Sha256, 32>;
+
+    fn key(index: u64) -> Key {
+        FixedBytes::new(index.to_be_bytes())
+    }
+
+    /// A member at `location`, holding its own key as value, with successor `next` if known.
+    fn entry(index: u64, location: u64, next: Option<u64>) -> TrustedEntry<F, Key, Key> {
+        TrustedEntry {
+            key: key(index),
+            location: KnownTrusted(Location::new(location)),
+            value: KnownTrusted(key(index)),
+            next_key: next.map_or(Unknown, |next| KnownTrusted(key(next))),
+        }
+    }
+
+    fn span(predecessor: u64, successor: u64) -> (Key, Key) {
+        (key(predecessor), key(successor))
+    }
+
+    /// A ten-operation checkpoint; its terminal commit is at location 9.
+    fn commitment() -> CurrentCommitment<F, Key, FixedEncoding<Key>, Sha256, 32> {
+        CurrentCommitment::from_parts(Location::new(10), Sha256::hash(&[b"root".as_slice()]))
+            .unwrap()
+    }
+
+    #[test]
+    fn spans_are_open_cyclic_intervals() {
+        let contains = |start: u64, end: u64, key: u64| strict_span_contains(&start, &end, &key);
+        assert!(contains(3, 7, 5));
+        assert!(!contains(3, 7, 3) && !contains(3, 7, 7) && !contains(3, 7, 9));
+        // A wrapping span covers keys above its predecessor and below its successor.
+        assert!(contains(7, 3, 9) && contains(7, 3, 0));
+        assert!(!contains(7, 3, 5) && !contains(7, 3, 3) && !contains(7, 3, 7));
+        // The edge of a one-key database covers every other key.
+        assert!(contains(4, 4, 0) && contains(4, 4, 9) && !contains(4, 4, 4));
+
+        let edges = BTreeMap::from([(2u64, 5u64), (5, 9), (9, 2)]);
+        let find = |key: u64| containing_edge(&edges, &key, |next| next).map(|(start, _)| *start);
+        assert_eq!(find(3), Some(2));
+        assert_eq!(find(7), Some(5));
+        assert_eq!(find(10), Some(9));
+        assert_eq!(find(0), Some(9));
+        assert_eq!(find(5), None);
+    }
+
+    #[test]
+    fn contradictory_facts_are_rejected() {
+        let check = |entries: Vec<_>, spans: Vec<_>| State::new(entries, spans).map(|_| ());
+        let invalid = Err(VerifyError::InvalidTrustedState);
+        // An explicit span may repeat an entry's edge, and the same span may arrive twice.
+        assert_eq!(
+            check(
+                vec![entry(2, 1, Some(5)), entry(5, 2, Some(9))],
+                vec![span(2, 5), span(2, 5)]
+            ),
+            Ok(())
+        );
+        // One key twice, or two keys at one location.
+        assert_eq!(
+            check(vec![entry(2, 1, None), entry(2, 3, None)], vec![]),
+            invalid
+        );
+        assert_eq!(
+            check(vec![entry(2, 1, None), entry(5, 1, None)], vec![]),
+            invalid
+        );
+        // Two successors for one key, or two predecessors for one key.
+        assert_eq!(check(vec![entry(2, 1, Some(5))], vec![span(2, 7)]), invalid);
+        assert_eq!(
+            check(vec![entry(2, 1, Some(9)), entry(5, 2, Some(9))], vec![]),
+            invalid
+        );
+        // A member inside a span, whichever is learned first.
+        assert_eq!(check(vec![entry(5, 2, None)], vec![span(2, 9)]), invalid);
+        assert_eq!(
+            check(vec![entry(2, 1, Some(9)), entry(5, 2, None)], vec![]),
+            invalid
+        );
+        // Overlapping spans, wrapping or not, and a one-key circle beside another key.
+        assert_eq!(check(vec![], vec![span(3, 8), span(6, 9)]), invalid);
+        assert_eq!(check(vec![], vec![span(8, 2), span(9, 3)]), invalid);
+        assert_eq!(check(vec![], vec![span(8, 2), span(1, 4)]), invalid);
+        assert_eq!(
+            check(vec![entry(4, 1, Some(4)), entry(6, 2, None)], vec![]),
+            invalid
+        );
+    }
+
+    #[test]
+    fn an_edge_survives_while_either_source_retains_it() {
+        let mut state = State::new([entry(2, 1, Some(5))], [span(2, 5)]).unwrap();
+        state.remove_entry(&key(2)).unwrap();
+        assert_eq!(state.known_edge(&key(2)), Some(&key(5)));
+        assert!(state.is_claimed_member(&key(2)) && state.is_claimed_member(&key(5)));
+        assert_eq!(state.remove_span(&key(2)), Some(key(5)));
+        assert_eq!(state.known_edge(&key(2)), None);
+        assert_eq!(state.predecessor_of(&key(5)), None);
+        assert!(!state.is_claimed_member(&key(2)));
+
+        let mut state = State::new([entry(2, 1, Some(5))], [span(2, 5)]).unwrap();
+        assert_eq!(state.remove_span(&key(2)), Some(key(5)));
+        assert_eq!(state.containing_edge(&key(3)), Some((&key(2), &key(5))));
+        state.remove_entry(&key(2)).unwrap();
+        assert_eq!(state.containing_edge(&key(3)), None);
+        // Forgetting the entry also frees its location.
+        state.insert_entry(entry(7, 1, None)).unwrap();
+    }
+
+    #[test]
+    fn the_map_bounds_locations_and_restores_a_refused_replacement() {
+        let bind = |entries: Vec<_>| {
+            Map::from_state(
+                commitment(),
+                TrustedState::Partial(State::new(entries, []).unwrap()),
+            )
+        };
+        // The terminal commit holds location 9, so no member can.
+        assert!(matches!(
+            bind(vec![entry(2, 9, None)]),
+            Err(VerifyError::InvalidTrustedState)
+        ));
+        let mut map = bind(vec![entry(2, 8, Some(5)), entry(5, 3, None)]).unwrap();
+        map.install_span(key(5), key(2)).unwrap();
+        assert_eq!(
+            map.replace_entry(entry(2, 9, Some(5))),
+            Err(VerifyError::InvalidTrustedState)
+        );
+        // A successor past the member 5 is refused, and the old entry stays.
+        assert_eq!(
+            map.replace_entry(entry(2, 8, Some(7))),
+            Err(VerifyError::InvalidTrustedState)
+        );
+        assert_eq!(map.entry(&key(2)).unwrap().next_key, KnownTrusted(key(5)));
+        assert_eq!(map.absence_span(&key(3)), Some((&key(2), &key(5))));
+        map.replace_entry(entry(2, 7, Some(5))).unwrap();
+        assert_eq!(
+            map.entry(&key(2)).unwrap().location,
+            KnownTrusted(Location::new(7))
+        );
+
+        // A database known to be empty holds no members or spans.
+        let mut empty = Map::from_state(commitment(), TrustedState::EmptyDatabase).unwrap();
+        assert_eq!(
+            empty.install_span(key(2), key(5)),
+            Err(VerifyError::InvalidTrustedState)
+        );
+        assert_eq!(
+            empty.replace_entry(entry(2, 1, None)),
+            Err(VerifyError::InvalidTrustedState)
+        );
+        assert!(empty.remove_entry(&key(2)).is_none());
+        assert_eq!(empty.absence_span(&key(2)), None);
+    }
+}
