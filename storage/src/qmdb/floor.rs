@@ -34,11 +34,11 @@
 //! A walk reads candidates in rounds and may hold the operations of up to `entries` reached
 //! candidates in memory at once.
 
-#![cfg_attr(not(feature = "std"), allow(dead_code))]
-
 use crate::merkle::{Family, Location};
+use alloc::vec::Vec;
 use commonware_utils::Widen;
 use core::marker::PhantomData;
+use thiserror::Error;
 
 /// How far a walk advances the floor: it decides at most `entries` active updates and passes at
 /// most `skips` inactive locations. Skips left once `entries` updates are decided go unspent, and
@@ -274,6 +274,7 @@ impl<F: Family> Walk<F> {
     /// The number of leading `candidates`, the ascending locations of active updates, that the
     /// walk's remaining entries and skips let it reach. A policy may stop the walk before it
     /// decides them all.
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
     pub(crate) fn reachable(&self, candidates: &[u64]) -> usize {
         let (mut floor, mut skips) = (*self.floor, self.skips);
         candidates
@@ -298,6 +299,118 @@ impl<F: Family> Walk<F> {
         self.floor += gap;
         self.skips -= gap;
     }
+}
+
+/// How a replayed walk ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum End<F: Family> {
+    /// Its entries ran out, or it had none: the floor stayed where the last decision left it.
+    Entries,
+    /// The policy stopped at the update at this location, which is also the floor.
+    Stopped(Location<F>),
+    /// No active update remained below the tip, so the floor advanced toward the tip.
+    Exhausted,
+    /// The next active update lay beyond the remaining skips.
+    Skips,
+}
+
+/// The result of [`replay`]: the floor the walk reached and the updates it moved to the tip.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Replayed<F: Family, V> {
+    /// The floor the walk reached.
+    pub floor: Location<F>,
+    /// How the walk ended.
+    pub end: End<F>,
+    /// Each moved update's source location, ascending, with the value written for it at the tip.
+    pub moves: Vec<(Location<F>, V)>,
+}
+
+/// Why [`replay`] could not replay a walk.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum ReplayError {
+    /// The policy [may evict](Policy::evicts). An evicting walk cannot be replayed from the
+    /// updates it reaches alone, because an ordered database must also repair the links its
+    /// evictions break.
+    #[error("the floor policy may evict")]
+    Evicts,
+    /// The policy evicted an update although it reported that it never evicts.
+    #[error("a floor policy that never evicts returned an eviction")]
+    Evicted,
+    /// A candidate lay at or past the tip, or below the floor the walk had reached, as one out
+    /// of ascending order does.
+    #[error("floor candidates must ascend within [floor, tip)")]
+    Unordered,
+}
+
+/// Replay the floor walk `policy` takes over `candidates`, the active updates in `[floor, tip)`
+/// in ascending location order, without reading a database.
+///
+/// `made_inactive` is the count a batch hands [`Policy::limits`]: one per update its writes
+/// supersede and two per delete. The walk reaches, decides and ends exactly as a batch's own
+/// walk does, so a verifier holding the same authenticated candidates derives the same floor and
+/// the same moves. Candidates the walk does not reach need not be supplied, but every candidate
+/// below the point where the walk ends must be, or it ends elsewhere.
+///
+/// # Errors
+///
+/// Returns [`ReplayError::Evicts`] when the policy [may evict](Policy::evicts),
+/// [`ReplayError::Evicted`] when it evicts anyway, and [`ReplayError::Unordered`] for a
+/// candidate at or past `tip` or below the floor the walk has reached. The policy may already
+/// have decided earlier candidates when an error is returned.
+pub fn replay<'a, F, K, V, P>(
+    policy: &mut P,
+    floor: Location<F>,
+    tip: Location<F>,
+    made_inactive: usize,
+    candidates: impl IntoIterator<Item = (Location<F>, &'a K, V)>,
+) -> Result<Replayed<F, V>, ReplayError>
+where
+    F: Family,
+    K: 'a,
+    P: Policy<F, K, V>,
+{
+    if policy.evicts() {
+        return Err(ReplayError::Evicts);
+    }
+    let Limits { entries, skips } = policy.limits(made_inactive);
+    let mut walk = Walk::new(floor, tip, entries, skips);
+    let mut moves = Vec::new();
+    let mut end = (walk.entries == 0).then_some(End::Entries);
+    if end.is_none() {
+        for (loc, key, value) in candidates {
+            if loc < walk.floor || loc >= tip {
+                return Err(ReplayError::Unordered);
+            }
+            if !walk.reach(loc) {
+                end = Some(End::Skips);
+                break;
+            }
+            match policy.decide(Entry::new(loc, key, value)).into_action() {
+                Action::Write(value) => {
+                    moves.push((loc, value));
+                    walk.decide();
+                    if walk.entries == 0 {
+                        end = Some(End::Entries);
+                        break;
+                    }
+                }
+                Action::Stop => {
+                    end = Some(End::Stopped(loc));
+                    break;
+                }
+                Action::Evict => return Err(ReplayError::Evicted),
+            }
+        }
+    }
+    let end = end.unwrap_or_else(|| {
+        walk.exhaust();
+        End::Exhausted
+    });
+    Ok(Replayed {
+        floor: walk.floor,
+        end,
+        moves,
+    })
 }
 
 /// Advances the floor in proportion to the operations a batch makes inactive.
@@ -464,5 +577,163 @@ mod tests {
         assert_eq!(Walk::new(at(0), at(100), 2, 0).reachable(&[1]), 0);
         assert_eq!(Walk::new(at(0), at(100), 0, 10).reachable(&[0]), 0);
         assert_eq!(Walk::new(at(0), at(100), 2, 0).reachable(&[]), 0);
+    }
+
+    fn replayed(
+        policy: &mut impl Policy<mmr::Family, u64, u64>,
+        floor: u64,
+        tip: u64,
+        made_inactive: usize,
+        active: &[u64],
+    ) -> Replayed<mmr::Family, u64> {
+        let keys: Vec<u64> = active.to_vec();
+        replay(
+            policy,
+            at(floor),
+            at(tip),
+            made_inactive,
+            active
+                .iter()
+                .zip(&keys)
+                .map(|(&loc, key)| (at(loc), key, loc)),
+        )
+        .unwrap()
+    }
+
+    /// Proportional moves one update per inactivated operation plus one, then reaches the tip.
+    #[test]
+    fn replay_proportional_moves_then_reaches_the_tip() {
+        // Two inactivated operations allow three moves; only two candidates exist.
+        let result = replayed(&mut Proportional, 0, 10, 2, &[1, 4]);
+        assert_eq!(result.moves, vec![(at(1), 1), (at(4), 4)]);
+        assert_eq!(result.floor, at(10));
+        assert_eq!(result.end, End::Exhausted);
+        // One inactivated operation allows two moves and the floor stops after the second.
+        let result = replayed(&mut Proportional, 0, 10, 1, &[1, 4, 6]);
+        assert_eq!(result.moves, vec![(at(1), 1), (at(4), 4)]);
+        assert_eq!(result.floor, at(5));
+        assert_eq!(result.end, End::Entries);
+    }
+
+    /// Hold reads nothing and leaves the floor where it was inherited.
+    #[test]
+    fn replay_hold_keeps_the_floor() {
+        let result = replayed(&mut Hold, 3, 10, 5, &[3, 4]);
+        assert!(result.moves.is_empty());
+        assert_eq!(result.floor, at(3));
+        assert_eq!(result.end, End::Entries);
+    }
+
+    /// Bounded passes at most `skips` inactive locations and decides at most `entries` updates.
+    #[test]
+    fn replay_bounded_stops_at_its_limits() {
+        let result = replayed(
+            &mut Bounded {
+                entries: 5,
+                skips: 2,
+            },
+            0,
+            100,
+            0,
+            &[1, 2, 9],
+        );
+        assert_eq!(result.moves, vec![(at(1), 1), (at(2), 2)]);
+        // One skip is spent reaching the first update; the last is spent on the way to 9.
+        assert_eq!(result.floor, at(4));
+        assert_eq!(result.end, End::Skips);
+    }
+
+    /// A policy that stops ends the walk with the floor at that update.
+    #[test]
+    fn replay_stop_ends_at_the_update() {
+        struct StopAt(u64);
+        impl Policy<mmr::Family, u64, u64> for StopAt {
+            fn evicts(&self) -> bool {
+                false
+            }
+            fn limits(&self, _: usize) -> Limits {
+                Limits {
+                    entries: usize::MAX,
+                    skips: u64::MAX,
+                }
+            }
+            fn decide<'a>(&mut self, entry: Entry<'a, mmr::Family, u64, u64>) -> Decision<'a, u64> {
+                if *entry.key() == self.0 {
+                    entry.stop()
+                } else {
+                    entry.keep()
+                }
+            }
+        }
+        let result = replayed(&mut StopAt(4), 0, 10, 0, &[1, 4, 6]);
+        assert_eq!(result.moves, vec![(at(1), 1)]);
+        assert_eq!(result.floor, at(4));
+        assert_eq!(result.end, End::Stopped(at(4)));
+    }
+
+    /// A policy that may evict is refused.
+    #[test]
+    fn replay_refuses_evicting_policies() {
+        struct Evictor;
+        impl Policy<mmr::Family, u64, u64> for Evictor {
+            fn evicts(&self) -> bool {
+                true
+            }
+            fn limits(&self, _: usize) -> Limits {
+                Limits {
+                    entries: 1,
+                    skips: 0,
+                }
+            }
+            fn decide<'a>(&mut self, entry: Entry<'a, mmr::Family, u64, u64>) -> Decision<'a, u64> {
+                entry.evict().0
+            }
+        }
+        let result = replay(&mut Evictor, at(0), at(10), 0, [(at(1), &1u64, 1u64)]);
+        assert_eq!(result, Err(ReplayError::Evicts));
+    }
+
+    /// A policy that evicts after reporting that it never does is refused, not obeyed.
+    #[test]
+    fn replay_refuses_an_unannounced_eviction() {
+        struct Liar;
+        impl Policy<mmr::Family, u64, u64> for Liar {
+            fn evicts(&self) -> bool {
+                false
+            }
+            fn limits(&self, _: usize) -> Limits {
+                Limits {
+                    entries: 1,
+                    skips: u64::MAX,
+                }
+            }
+            fn decide<'a>(&mut self, entry: Entry<'a, mmr::Family, u64, u64>) -> Decision<'a, u64> {
+                entry.evict().0
+            }
+        }
+        let result = replay(&mut Liar, at(0), at(10), 0, [(at(1), &1u64, 1u64)]);
+        assert_eq!(result, Err(ReplayError::Evicted));
+    }
+
+    /// Candidates out of order, below the floor, or at the tip are refused.
+    #[test]
+    fn replay_refuses_unordered_candidates() {
+        let replay_at = |floor: u64, tip: u64, locations: &[u64]| {
+            let keys = locations.to_vec();
+            replay(
+                &mut Proportional,
+                at(floor),
+                at(tip),
+                4,
+                locations
+                    .iter()
+                    .zip(&keys)
+                    .map(|(&loc, key)| (at(loc), key, loc)),
+            )
+        };
+        assert_eq!(replay_at(0, 10, &[4, 2]), Err(ReplayError::Unordered));
+        assert_eq!(replay_at(3, 10, &[2]), Err(ReplayError::Unordered));
+        assert_eq!(replay_at(0, 10, &[10]), Err(ReplayError::Unordered));
+        assert!(replay_at(0, 10, &[2, 4]).is_ok());
     }
 }
