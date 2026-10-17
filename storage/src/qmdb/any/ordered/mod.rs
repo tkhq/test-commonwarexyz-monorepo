@@ -32,6 +32,8 @@ use futures::{
     stream::{self, Stream},
 };
 
+pub(crate) mod range;
+
 #[cfg(feature = "std")]
 pub mod fixed;
 #[cfg(feature = "std")]

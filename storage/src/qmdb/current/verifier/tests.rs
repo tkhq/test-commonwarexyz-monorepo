@@ -2,7 +2,7 @@
 
 use super::{
     BatchProofBundle, BitmapFault, BitmapProof, BitmapUnit, BuildError, BundleConfig,
-    CandidateFault, CurrentCommitment, InsufficientPreState, PreStateKeyClaim,
+    CandidateFault, CurrentCommitment, InsufficientPreState, PreStateKeyClaim, PreStateMemberClaim,
     PreStateOpeningClaim, TrustedMap, UserBatch, UserOp, VerifyError,
     subtree::{SubtreeTarget, create_multi_subtree_proof},
 };
@@ -1213,6 +1213,145 @@ fn prover_refuses_unsupported_policies() {
         ));
         db.destroy().await.unwrap();
     });
+}
+
+/// A finite interval is proven by its lower endpoint's classification and every member after it.
+async fn range_claims<F: Graftable>(context: deterministic::Context) {
+    use crate::qmdb::current::ordered::proof::verify_range;
+
+    let page_cache = CacheRef::new(NZU16!(4096), NZUsize!(16));
+    let config = FixedConfig {
+        merkle_config: MerkleConfig {
+            journal_partition: "range-claims-nodes".into(),
+            replay_buffer: NZUsize!(4096),
+            metadata_partition: "range-claims-merkle-metadata".into(),
+            items_per_blob: NZU64!(1024),
+            write_buffer: NZUsize!(4096),
+            strategy: Sequential,
+            page_cache: page_cache.clone(),
+        },
+        journal_config: JournalConfig {
+            partition: "range-claims-operations".into(),
+            replay_buffer: NZUsize!(4096),
+            items_per_blob: NZU64!(1024),
+            write_buffer: NZUsize!(4096),
+            page_cache,
+        },
+        grafted_metadata_partition: "range-claims-grafted".into(),
+        translator: OneCap,
+        init_cache: Some(NZUsize!(1024)),
+        init_buffer: NZUsize!(4096),
+        init_concurrency: (),
+    };
+    let mut db = TestDb::<F, Sequential>::init(context, config, None)
+        .await
+        .unwrap();
+    let mut batch = Batch::new();
+    for i in 1..=6 {
+        batch.set(key(i * 10), key(i));
+    }
+    let merkleized = batch.merkleize(&db, &mut Proportional).await.unwrap();
+    db = db.apply_batch(merkleized).await.unwrap();
+    let commitment = Commitment::<F>::from_parts(db.bounds().end, db.root()).unwrap();
+
+    let member = async |at: u64| {
+        PreStateKeyClaim::Member(PreStateMemberClaim {
+            key: key(at),
+            value: key(at / 10),
+            proof: db.key_value_proof(key(at)).await.unwrap(),
+        })
+    };
+    let absent = async |at: u64| {
+        PreStateKeyClaim::Exclusion(super::PreStateExclusionClaim {
+            queried_key: key(at),
+            proof: db.exclusion_proof(&key(at)).await.unwrap(),
+        })
+    };
+    let (k20, k40) = (key(20), key(40));
+    let included = (Bound::Included(&k20), Bound::Included(&k40));
+
+    // Members from the lower endpoint on, with nothing missing, cover the interval.
+    let exact = [member(20).await, member(30).await, member(40).await];
+    assert!(verify_range::<F, _, _, Sha256, 32>(
+        included,
+        &exact,
+        &commitment
+    ));
+    // Dropping the middle member leaves a gap, which no claim fills.
+    let gap = [member(20).await, member(40).await];
+    assert!(!verify_range::<F, _, _, Sha256, 32>(
+        included,
+        &gap,
+        &commitment
+    ));
+    // The last member inside the interval cannot be omitted either.
+    let short = [member(20).await, member(30).await];
+    assert!(!verify_range::<F, _, _, Sha256, 32>(
+        included,
+        &short,
+        &commitment
+    ));
+    // A member past the interval is not part of it.
+    let long = [
+        member(20).await,
+        member(30).await,
+        member(40).await,
+        member(50).await,
+    ];
+    assert!(!verify_range::<F, _, _, Sha256, 32>(
+        included,
+        &long,
+        &commitment
+    ));
+    // An excluded lower bound starts at the member's successor.
+    let k20 = key(20);
+    let excluded = (Bound::Excluded(&k20), Bound::Included(&k40));
+    assert!(verify_range::<F, _, _, Sha256, 32>(
+        excluded,
+        &exact,
+        &commitment
+    ));
+    // A lower endpoint that is no member is classified by the proof of its absence.
+    let (k25, k45) = (key(25), key(45));
+    let between = (Bound::Included(&k25), Bound::Included(&k45));
+    let from_absent = [absent(25).await, member(30).await, member(40).await];
+    assert!(verify_range::<F, _, _, Sha256, 32>(
+        between,
+        &from_absent,
+        &commitment
+    ));
+    // Claims bind to the commitment they are checked against.
+    let other = Commitment::<F>::from_parts(
+        commitment.size(),
+        Sha256::hash(&[b"another root".as_slice()]),
+    )
+    .unwrap();
+    assert!(!verify_range::<F, _, _, Sha256, 32>(
+        included, &exact, &other
+    ));
+    // An interval must be finite and ordered.
+    let reversed = (Bound::Included(&k40), Bound::Included(&k20));
+    assert!(!verify_range::<F, _, _, Sha256, 32>(
+        reversed,
+        &exact,
+        &commitment
+    ));
+    let unbounded = (Bound::Unbounded, Bound::Included(&k40));
+    assert!(!verify_range::<F, _, _, Sha256, 32>(
+        unbounded,
+        &exact,
+        &commitment
+    ));
+}
+
+#[test]
+fn mmr_range_claims_cover_an_interval() {
+    deterministic::Runner::default().start(range_claims::<mmr::Family>);
+}
+
+#[test]
+fn mmb_range_claims_cover_an_interval() {
+    deterministic::Runner::default().start(range_claims::<mmb::Family>);
 }
 
 fn assert_send<T: Send>(_: T) {}

@@ -99,6 +99,94 @@ where
     }
 }
 
+/// Authenticate complete coverage of one finite original-key interval using existing claims.
+///
+/// The first claim describes the lower endpoint. Remaining claims must contain every successive
+/// member in order. All claims bind to the supplied complete trusted commitment. On success,
+/// member claims whose keys lie within `bounds` are exactly the range result.
+pub fn verify_range<F, K, V, H, const N: usize>(
+    bounds: (core::ops::Bound<&K>, core::ops::Bound<&K>),
+    claims: &[crate::qmdb::current::verifier::PreStateKeyClaim<F, K, V, H::Digest, N>],
+    commitment: &crate::qmdb::current::verifier::CurrentCommitment<F, K, V, H, N>,
+) -> bool
+where
+    F: Graftable,
+    K: Key,
+    V: ValueEncoding,
+    H: Hasher,
+    Operation<F, K, V>: Codec,
+{
+    use crate::qmdb::{any::ordered::range::RangeWalk, current::verifier::PreStateKeyClaim};
+    use core::ops::Bound;
+
+    let (Bound::Included(start) | Bound::Excluded(start)) = bounds.0 else {
+        return false;
+    };
+    let Some((anchor, remainder)) = claims.split_first() else {
+        return false;
+    };
+    let (exact, successor) = match anchor {
+        PreStateKeyClaim::Member(member) => {
+            if member.key != *start
+                || member.proof.proof.range_proof.proof.leaves != commitment.size()
+                || !member.proof.verify::<H, V>(
+                    member.key.clone(),
+                    member.value.clone(),
+                    commitment.root(),
+                )
+            {
+                return false;
+            }
+            (true, Some(&member.proof.next_key))
+        }
+        PreStateKeyClaim::Exclusion(absent) => {
+            if absent.queried_key != *start || !absent.proof.verify::<H>(start, commitment.root()) {
+                return false;
+            }
+            let (proof, successor) = match &absent.proof {
+                ExclusionProof::KeyValue(proof, update) => (proof, Some(&update.next_key)),
+                ExclusionProof::Commit(proof, _) => {
+                    if proof.loc != commitment.size() - 1 {
+                        return false;
+                    }
+                    (proof, None)
+                }
+            };
+            if proof.range_proof.proof.leaves != commitment.size() {
+                return false;
+            }
+            (false, successor)
+        }
+    };
+    let Ok(mut walk) = RangeWalk::new(bounds, exact, successor) else {
+        return false;
+    };
+    if exact && matches!(bounds.0, Bound::Included(_)) {
+        let Some(next) = successor else {
+            return false;
+        };
+        if !walk.advance(start, next) {
+            return false;
+        }
+    }
+    for claim in remainder {
+        let PreStateKeyClaim::Member(member) = claim else {
+            return false;
+        };
+        if !walk.advance(&member.key, &member.proof.next_key)
+            || member.proof.proof.range_proof.proof.leaves != commitment.size()
+            || !member.proof.verify::<H, V>(
+                member.key.clone(),
+                member.value.clone(),
+                commitment.root(),
+            )
+        {
+            return false;
+        }
+    }
+    walk.next().is_none()
+}
+
 #[cfg(feature = "arbitrary")]
 impl<F: Graftable, K: Key, D: Digest, C> arbitrary::Arbitrary<'_> for KeyValueProof<F, K, D, C>
 where
