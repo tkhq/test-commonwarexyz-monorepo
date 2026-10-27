@@ -80,7 +80,7 @@ async fn with_superseded_record<F: Graftable>(
     context: deterministic::Context,
 ) -> (TestDb<F>, Location<F>, Key) {
     let db = open::<F>(context).await;
-    let db = apply(db, &Batch::from_iter((1..=8).map(|i| UserBatchOp::set(i)))).await;
+    let db = apply(db, &Batch::from_iter((1..=8).map(UserBatchOp::set))).await;
     let (old, old_loc) = db.any.get_with_loc(&key(3)).await.unwrap().unwrap();
     let db = apply(db, &Batch::from([UserBatchOp::set_value(3, 300)])).await;
     (db, old_loc, old.next_key)

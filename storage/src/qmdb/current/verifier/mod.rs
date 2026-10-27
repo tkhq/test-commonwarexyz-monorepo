@@ -9,11 +9,12 @@
 //! equals the caller's claimed post-state. [`Verified::into_cache`] turns it into a
 //! [`TrustedMap`] bound to that commitment for the next batch.
 //!
-//! A storage-backed writer uses `UserBatch::build_batch_proof` to supply complete
-//! evidence for an empty client cache, and `UserBatch::merkleize` to compute the
-//! proposed post-state through the ordinary database writer. Both calls must use the
-//! same database checkpoint. The client independently calls [`UserBatch::verify`]
-//! before accepting that state. Proof production never changes the database.
+//! A storage-backed writer uses `UserBatch::prove` to compute the proposed post-state
+//! through the ordinary database writer and, from that merkleized batch, complete evidence
+//! for an empty client cache. `UserBatch::build_batch_proof` returns only the evidence, and
+//! `UserBatch::merkleize` only the batch; used apart, both must use the same database
+//! checkpoint. The client independently calls [`UserBatch::verify`] before accepting that
+//! state. Proof production never changes the database.
 //!
 //! The commitment does not record how far a batch advanced the inactivity floor, so the
 //! verifier and the writer must use the same [`Policy`](crate::qmdb::floor::Policy). The
@@ -155,8 +156,8 @@
 //! bounds the live records the scan reaches, not the inactive bits it crosses, but those
 //! bits cost O(log n) units per run. Thus `p`, `f`, and `u` are O(k) up to that logarithmic
 //! factor, and an honest bundle does not grow with the old log for a small batch. The
-//! prover still compares every scanned chunk in memory. See `UserBatch::build_batch_proof`
-//! for database lookup, collision, and I/O costs in addition to these verification bounds.
+//! prover still compares every scanned chunk in memory. See `UserBatch::prove` for database
+//! lookup, collision, and I/O costs in addition to these verification bounds.
 
 // Bundles are untrusted input: report a malformed one as an error, never a panic.
 #![cfg_attr(

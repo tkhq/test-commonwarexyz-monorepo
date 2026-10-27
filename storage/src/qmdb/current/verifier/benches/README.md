@@ -7,7 +7,7 @@ cargo bench -p commonware-storage --bench stateless_verifier
 RUSTFLAGS="--cfg full_bench" cargo bench -p commonware-storage --bench stateless_verifier
 ```
 
-Criterion times `build_batch_proof`, a writer's step (the bundle and `merkleize`) and
+Criterion times `build_batch_proof`, a writer's step (`prove`: the bundle and the merkleized batch) and
 empty-cache `verify` separately, using honest seeded workloads from `harness.rs`. The
 verifier case does not call `into_cache`, which a recipient that keeps facts pays in
 addition. Fixtures use MMR and MMB, the Tokio storage runtime, EightCap, SHA-256,
@@ -23,5 +23,6 @@ Each case builds its database the first time Criterion runs it, so listing cases
 filtering by name builds nothing for the cases skipped, and keeps one runtime,
 checkpoint, and batch alive through warmup and measurement. Setup, PRNG work,
 normalization, and model checks are outside the timers; producing or verifying and
-dropping the result are inside. Proving includes internal checks. Add
+dropping the result are inside. Proving verifies its own bundle only with the
+`prover-self-check` feature. Add
 `-- 'threads=8'` to the benchmark command to select only Rayon cases.
