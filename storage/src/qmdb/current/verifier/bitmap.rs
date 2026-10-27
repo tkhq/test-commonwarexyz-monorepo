@@ -44,11 +44,13 @@ const PARALLEL_TARGETS: usize = 32;
 /// chunks compared in memory, `u` emitted units, and height `h`; memory and node reads are
 /// O((u + 1) * h + e * N) for `e` explicit chunks, excluding backend costs.
 #[cfg(feature = "std")]
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn build_bitmap_proof<F, K, V, H, B, R, G, const N: usize>(
     pre_size: Location<F>,
     old_floor: Location<F>,
     floor_scan_end: Location<F>,
     prepared: &PreparedOrderedBatch<F, K, V>,
+    claimed: &BTreeSet<Location<F>>,
     bitmap: &B,
     raw_storage: &R,
     grafted_storage: &G,
@@ -73,6 +75,7 @@ where
         old_floor,
         floor_scan_end,
         prepared,
+        claimed,
         chunk_bits,
         graftable,
     );
@@ -376,7 +379,7 @@ impl<F: Family, D: Digest, const N: usize> VerifiedBitmapView<F, D, N> {
 /// reconstruction needs full bytes for changed old chunks to preserve unrelated bits.
 /// This helper determines those requirements before inspecting the supplied units.
 ///
-/// Cover the proposed floor scan, every superseded record, and the old terminal.
+/// Cover the proposed floor scan, every superseded or claimed record, and the old terminal.
 /// Force scan-boundary chunks to be explicit when the boundary cuts a chunk. Also
 /// require old pending and partial bytes because appends may graft or complete them.
 /// Return sorted intervals with overlaps merged. Touching intervals remain separate
@@ -387,6 +390,7 @@ fn required_chunk_intervals<F, K, V>(
     old_floor: Location<F>,
     floor_scan_end: Location<F>,
     prepared: &PreparedOrderedBatch<F, K, V>,
+    claimed: &BTreeSet<Location<F>>,
     chunk_bits: u64,
     graftable_chunks: u64,
 ) -> RequiredChunks
@@ -411,6 +415,7 @@ where
     for location in prepared
         .superseded
         .iter()
+        .chain(claimed)
         .copied()
         .chain(core::iter::once(pre_size - 1))
     {
@@ -503,6 +508,7 @@ pub(crate) fn set_chunk_bit<const N: usize>(
 pub(crate) fn verify_bitmap<F, K, V, H, const N: usize, S: Strategy>(
     pre: &AuthenticatedPreState<F, K, V, H, N>,
     prepared: &PreparedOrderedBatch<F, K, V>,
+    claimed: &BTreeSet<Location<F>>,
     proof: &BitmapProof<F, H::Digest, N>,
     strategy: &S,
 ) -> Result<VerifiedBitmapView<F, H::Digest, N>, VerifyError>
@@ -532,6 +538,7 @@ where
         pre.old_floor,
         floor_scan_end,
         prepared,
+        claimed,
         chunk_bits,
         graftable_chunks,
     );
@@ -787,6 +794,7 @@ mod tests {
             Location::new(old_floor),
             Location::new(floor_scan_end),
             &prepared,
+            &BTreeSet::new(),
             8,
             graftable_chunks,
         );

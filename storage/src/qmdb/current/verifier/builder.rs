@@ -14,7 +14,7 @@ use crate::{
     Context,
     index::Ordered as OrderedIndex,
     journal::contiguous::{Contiguous as _, Mutable},
-    merkle::{self, ElementPlan, Graftable, Location, storage::Storage as _},
+    merkle::{self, Graftable, Location},
     qmdb::{
         self,
         any::{
@@ -22,11 +22,7 @@ use crate::{
             batch::DiffEntry,
             operation::{Operation, update},
         },
-        current::{
-            batch::MerkleizedBatch,
-            ordered::{self, proof::constant::ExclusionProof},
-            proof::constant::OperationProof,
-        },
+        current::{batch::MerkleizedBatch, ordered},
         floor::Policy,
         operation::Key,
     },
@@ -49,11 +45,12 @@ impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
     /// Merkleize this batch through the ordinary database writer and build its proof bundle
     /// from the merkleized batch, against this database's current committed checkpoint.
     ///
-    /// The bundle works with an empty trusted cache. Ordered membership and exclusion
-    /// proofs cover the requested keys, every member of a delete range, and affected
-    /// predecessors. A range with no lower bound adds the greatest key's record, whose
-    /// successor link proves where the range begins. Bitmap and raw-log proofs cover
-    /// the floor scan. No database writes occur, and the returned batch is unapplied.
+    /// The bundle works with an empty trusted cache. Member and exclusion claims cover the
+    /// requested keys, every member of a delete range, and affected predecessors. A range
+    /// with no lower bound adds the greatest key's record, whose successor link proves where
+    /// the range begins. One raw multi-proof covers every claimed record and floor
+    /// candidate, and the bitmap proof covers the floor scan and each claimed record's
+    /// chunk. No database writes occur, and the returned batch is unapplied.
     /// The recipient must still call `verify` with its trusted pre-commitment and the
     /// batch's post-commitment; proof construction does not authorize a transition.
     /// With the `prover-self-check` feature the bundle is also verified before it is returned;
@@ -74,9 +71,10 @@ impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
     /// Use `n`, `m`, `k`, and `h` from the [module complexity discussion](super#complexity),
     /// and let `d` be the number of keys in the batch's diff: mutated keys, rewritten
     /// predecessors, and records the floor walk moved. On top of `merkleize`, this takes O(d)
-    /// record reads, one operation proof per claim, the floor replay over the scanned
-    /// candidates, the bitmap proof, and O(d * log(d + 2)) ordered-set work, with O(d + t)
-    /// additional memory for `t = (k + e + 1) * h` proof digests and `e` bitmap units. An
+    /// record reads, one raw multi-proof over the claims and candidates, the floor replay over
+    /// the scanned candidates, the bitmap proof, and O(d * log(d + 2)) ordered-set work, with
+    /// O(d + t) additional memory for `t = (k + e + 1) * h` proof digests and `e` bitmap
+    /// units. An
     /// index lookup, O(i + l * log(l + 2)) for index work `i` and largest bucket `l`, happens
     /// only for the keys named above. The record reads run concurrently.
     #[allow(clippy::type_complexity)]
@@ -139,6 +137,29 @@ impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
             replay,
         )
         .await?;
+        // One raw multi-proof covers every record the claims and candidates carry.
+        let claimed = pre_state_claims
+            .iter()
+            .map(|claim| match claim {
+                PreStateKeyClaim::Member(claim) => claim.location,
+                PreStateKeyClaim::Exclusion(claim) => claim.location,
+            })
+            .collect::<BTreeSet<_>>();
+        let mut records = claimed.clone();
+        records.extend(walked.proof.operations.iter().map(|(location, _)| *location));
+        let records = records.into_iter().collect::<Vec<_>>();
+        let records_proof = if records.is_empty() {
+            None
+        } else {
+            Some(
+                merkle::verification::multi_proof(
+                    &db.any.log.merkle,
+                    F::inactive_peaks(commitment.size(), old_floor),
+                    &records,
+                )
+                .await?,
+            )
+        };
         let bounds = batch.bounds();
         if child_size(commitment.size(), &prepared, walked.copies)? != bounds.tip.size
             || walked.floor != bounds.inactivity_floor
@@ -152,6 +173,7 @@ impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
             old_floor,
             walked.scan_end,
             &prepared,
+            &claimed,
             db.bitmap(),
             &db.any.log.merkle,
             &db.grafted_storage(),
@@ -168,6 +190,7 @@ impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
             pre_state_claims,
             bitmap,
             walked.proof,
+            records_proof,
         );
         #[cfg(feature = "prover-self-check")]
         {
@@ -217,13 +240,14 @@ impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
     /// record is a member. An absent key's exclusion uses the old record whose successor link
     /// spans it: such a record is the key's pre-state span owner, since no pre-state key lies
     /// inside a successor link. Keys the batch did not reveal fall back to the database index.
+    /// An empty pre-state needs no claims: its opening establishes that every key is absent.
     async fn claims<F, E, C, V, I, H, const N: usize, S>(
         &self,
         db: &ordered::db::Db<F, E, C, K, V, I, H, N, S>,
         expanded: &BTreeMap<K, Option<&A>>,
         prepared: &PreparedOrderedBatch<F, K, V>,
         old: &[ExactRecord<F, K, V>],
-    ) -> Result<Vec<PreStateKeyClaim<F, K, V, H::Digest, N>>, BuildError<F>>
+    ) -> Result<Vec<PreStateKeyClaim<F, K, V>>, BuildError<F>>
     where
         F: Graftable,
         E: Context,
@@ -295,55 +319,46 @@ impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
             requests.insert(record.1.key.clone(), Request::Member(record));
         }
 
-        // Settle the keys the batch did not reveal, then build every claim's operation proof
-        // together.
-        let requests = try_join_all(requests.into_iter().map(|(key, request)| async move {
-                Ok::<_, BuildError<F>>(match request {
+        // Settle the keys the batch did not reveal. An absent key's span owner comes from the
+        // index; an empty pre-state has none and needs no claim.
+        let claims = try_join_all(requests.into_iter().map(|(key, request)| async move {
+                let request = match request {
                     Request::Unknown => match db.any.get_with_loc(&key).await? {
-                        Some((update, location)) => (key, Request::Member((location, update))),
-                        None => (key, Request::Absent),
+                        Some((update, location)) => Request::Member((location, update)),
+                        None => Request::Absent,
                     },
-                    request => (key, request),
-                })
+                    request => request,
+                };
+                let request = match request {
+                    Request::Absent => match db.any.get_span(&key).await? {
+                        Some(owner) => Request::Excluded(owner),
+                        None => return Ok(None),
+                    },
+                    request => request,
+                };
+                Ok::<_, BuildError<F>>(Some(match request {
+                    Request::Member((location, update)) => {
+                        PreStateKeyClaim::Member(PreStateMemberClaim {
+                            location,
+                            key,
+                            value: update.value,
+                            next_key: update.next_key,
+                        })
+                    }
+                    Request::Excluded((location, owner)) => {
+                        PreStateKeyClaim::Exclusion(PreStateExclusionClaim {
+                            queried_key: key,
+                            location,
+                            owner,
+                        })
+                    }
+                    Request::Absent | Request::Unknown => {
+                        return Err(BuildError::InvalidState("an absent key was not resolved"));
+                    }
+                }))
             }))
             .await?;
-        let locations = requests
-            .iter()
-            .filter_map(|(_, request)| match request {
-                Request::Member((location, _)) | Request::Excluded((location, _)) => {
-                    Some(*location)
-                }
-                Request::Absent | Request::Unknown => None,
-            })
-            .collect::<Vec<_>>();
-        let mut proofs = operation_proofs(db, &locations).await?.into_iter();
-        let missing = || BuildError::InvalidState("an operation proof was not built");
-        let mut claims = Vec::with_capacity(requests.len());
-        for (key, request) in requests {
-            claims.push(match request {
-                Request::Member((_, update)) => PreStateKeyClaim::Member(PreStateMemberClaim {
-                    proof: ordered::proof::constant::KeyValueProof {
-                        proof: proofs.next().ok_or_else(missing)?,
-                        next_key: update.next_key,
-                    },
-                    key,
-                    value: update.value,
-                }),
-                Request::Excluded((_, owner)) => {
-                    PreStateKeyClaim::Exclusion(PreStateExclusionClaim {
-                        proof: ExclusionProof::KeyValue(proofs.next().ok_or_else(missing)?, owner),
-                        queried_key: key,
-                    })
-                }
-                Request::Absent | Request::Unknown => {
-                    PreStateKeyClaim::Exclusion(PreStateExclusionClaim {
-                        proof: db.exclusion_proof(&key).await?,
-                        queried_key: key,
-                    })
-                }
-            });
-        }
-        Ok(claims)
+        Ok(claims.into_iter().flatten().collect())
     }
 
     /// Merkleize the same normalized mutations through the ordinary database writer.
@@ -550,51 +565,6 @@ where
     })
 }
 
-/// Build the operation proofs of `locations`, in order, together: plan each one, read the
-/// union of the nodes they need in one storage request, and build them on the database's
-/// strategy. Each proof equals the one the database builds for its location alone.
-async fn operation_proofs<F, E, C, K, V, I, H, const N: usize, S>(
-    db: &ordered::db::Db<F, E, C, K, V, I, H, N, S>,
-    locations: &[Location<F>],
-) -> Result<Vec<OperationProof<F, H::Digest, N>>, BuildError<F>>
-where
-    F: Graftable,
-    E: Context,
-    C: Mutable<Item = Operation<F, OrderedUpdate<K, V>>>,
-    K: Key,
-    V: ValueEncoding,
-    I: OrderedIndex<Value = Location<F>>,
-    H: Hasher,
-    S: Strategy,
-    Operation<F, OrderedUpdate<K, V>>: Codec,
-{
-    let storage = db.grafted_storage();
-    let leaves = Location::try_from(storage.size())?;
-    let plans = locations
-        .iter()
-        .map(|&location| ElementPlan::new(leaves, location))
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut positions = plans
-        .iter()
-        .flat_map(ElementPlan::positions)
-        .collect::<Vec<_>>();
-    positions.sort_unstable();
-    positions.dedup();
-    let digests = storage.get_nodes(&positions).await?;
-    let node = |position| {
-        positions
-            .binary_search(&position)
-            .ok()
-            .and_then(|index| digests.get(index))
-            .copied()
-    };
-    let status = db.bitmap();
-    let (floor, ops_root) = (db.any.inactivity_floor_loc, db.any.root());
-    Ok(db.strategy().try_map_collect_vec(plans, |plan| {
-        OperationProof::build::<H>(status, plan, node, floor, ops_root)
-    })?)
-}
-
 /// Locate the immediate cyclic predecessor needed when deleting a member.
 /// The index groups keys by translated prefixes, so inspect both the member's bucket
 /// and the previous bucket (wrapping at the minimum), then match the exact successor.
@@ -706,15 +676,15 @@ fn child_size<F: Graftable, K: Key, V: ValueEncoding>(
 }
 
 /// Floor candidates read for one batch, and what the floor walk over them decided.
-struct CandidateEvidence<F: Graftable, K: Key, V: ValueEncoding, D: commonware_cryptography::Digest> {
+struct CandidateEvidence<F: Graftable, K: Key, V: ValueEncoding> {
     /// The end of the old-log coverage the walk consumed.
     scan_end: Location<F>,
     /// The child's inactivity floor.
     floor: Location<F>,
     /// The number of live records the walk copies to the tip.
     copies: usize,
-    /// The candidates' payloads and their raw multi-proof.
-    proof: PreStateCandidateProof<F, K, V, D>,
+    /// The candidates' payloads.
+    proof: PreStateCandidateProof<F, K, V>,
 }
 
 /// Read old active records through the floor scan's required stopping point.
@@ -722,8 +692,8 @@ struct CandidateEvidence<F: Graftable, K: Key, V: ValueEncoding, D: commonware_c
 /// Records in `known`, read already at their locations, are not read again.
 /// Read as many live records as the floor policy's entry limit allows, then keep those
 /// the policy's walk consumes: stop where it ends, or cover the entire old log if
-/// copies must continue into the application suffix. A raw multi-proof authenticates
-/// these payloads; the bitmap proof separately establishes their completeness.
+/// copies must continue into the application suffix. The bundle's shared raw multi-proof
+/// authenticates these payloads; the bitmap proof separately establishes their completeness.
 async fn build_candidate_proof<F, E, C, K, V, I, H, P, const N: usize, S>(
     db: &ordered::db::Db<F, E, C, K, V, I, H, N, S>,
     prepared: &PreparedOrderedBatch<F, K, V>,
@@ -731,7 +701,7 @@ async fn build_candidate_proof<F, E, C, K, V, I, H, P, const N: usize, S>(
     pre_size: Location<F>,
     old_floor: Location<F>,
     mut policy: P,
-) -> Result<CandidateEvidence<F, K, V, H::Digest>, BuildError<F>>
+) -> Result<CandidateEvidence<F, K, V>, BuildError<F>>
 where
     F: Graftable,
     E: Context,
@@ -752,7 +722,6 @@ where
             copies: 0,
             proof: PreStateCandidateProof {
                 operations: Vec::new(),
-                raw_multi_proof: None,
             },
         });
     }
@@ -818,30 +787,10 @@ where
     let walked = walk_floor(old_floor, pre_size, prepared, &updates, &mut policy)?;
     let floor_scan_end = walked.scan_end;
     operations.retain(|(location, _)| *location < floor_scan_end);
-    let locations = operations
-        .iter()
-        .map(|(location, _)| *location)
-        .collect::<Vec<_>>();
-
-    let raw_multi_proof = if operations.is_empty() {
-        None
-    } else {
-        Some(
-            merkle::verification::multi_proof(
-                &db.any.log.merkle,
-                F::inactive_peaks(pre_size, old_floor),
-                &locations,
-            )
-            .await?,
-        )
-    };
     Ok(CandidateEvidence {
         scan_end: floor_scan_end,
         floor: walked.floor,
         copies: walked.copies.len(),
-        proof: PreStateCandidateProof {
-            operations,
-            raw_multi_proof,
-        },
+        proof: PreStateCandidateProof { operations },
     })
 }
