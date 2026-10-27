@@ -1,8 +1,9 @@
 //! Criterion measurements for complete proof construction.
 //!
-//! The timed operation is `UserBatch::build_batch_proof` only. Database initialization, the
-//! seeded bootstrap, batch generation, and runtime setup are outside the timer. The database
-//! uses the Tokio storage backend and `EightCap`, with Sequential or Rayon workers.
+//! The timed operation is `UserBatch::build_batch_proof` only, or with [`Timed::Step`] the proof
+//! and the merkleized batch a writer sends and applies. Database initialization, the seeded
+//! bootstrap, batch generation, and runtime setup are outside the timer. The database uses the
+//! Tokio storage backend and `EightCap`, with Sequential or Rayon workers.
 
 use super::common::{ACTION_COUNTS, KEY_COUNTS, PARALLEL_THREADS, prepare};
 use commonware_parallel::{Rayon, Sequential, Strategy};
@@ -19,8 +20,19 @@ use std::{
     time::{Duration, Instant},
 };
 
-fn bench_family<F: Graftable, S: Strategy>(
+/// What one timed iteration does.
+#[derive(Clone, Copy)]
+pub(crate) enum Timed {
+    /// Build the proof bundle.
+    Proof,
+    /// Build the proof bundle and the merkleized batch.
+    Step,
+}
+
+pub(crate) fn bench_family<F: Graftable, S: Strategy>(
     c: &mut Criterion,
+    name: &str,
+    timed: Timed,
     family: &str,
     strategy: S,
     threads: usize,
@@ -33,7 +45,7 @@ fn bench_family<F: Graftable, S: Strategy>(
             std::thread::scope(|scope| {
                 let mut server = None;
                 c.bench_function(
-                    &format!("{}/family={family} keys={key_count} actions={action_count} seed={seed} threads={threads}", module_path!()),
+                    &format!("{name}/family={family} keys={key_count} actions={action_count} seed={seed} threads={threads}"),
                     |b| {
                         let (commands, responses) = server.get_or_insert_with(|| {
                             let (commands, requests) = mpsc::channel::<u64>();
@@ -61,6 +73,15 @@ fn bench_family<F: Graftable, S: Strategy>(
                                                     .await
                                                     .unwrap(),
                                             );
+                                            if matches!(timed, Timed::Step) {
+                                                black_box(
+                                                    fixture
+                                                        .batch
+                                                        .merkleize(&fixture.database, &mut Proportional)
+                                                        .await
+                                                        .unwrap(),
+                                                );
+                                            }
                                         }
                                         results.send(start.elapsed()).unwrap();
                                     }
@@ -83,12 +104,17 @@ fn bench_family<F: Graftable, S: Strategy>(
     }
 }
 
-fn bench_prover(c: &mut Criterion) {
-    bench_family::<mmr::Family, _>(c, "mmr", Sequential, 1);
-    bench_family::<mmb::Family, _>(c, "mmb", Sequential, 1);
+/// Run `timed` for both families, sequentially and on Rayon.
+pub(crate) fn bench_all(c: &mut Criterion, name: &str, timed: Timed) {
+    bench_family::<mmr::Family, _>(c, name, timed, "mmr", Sequential, 1);
+    bench_family::<mmb::Family, _>(c, name, timed, "mmb", Sequential, 1);
     let strategy = Rayon::new(NZUsize!(PARALLEL_THREADS)).unwrap();
-    bench_family::<mmr::Family, _>(c, "mmr", strategy.clone(), PARALLEL_THREADS);
-    bench_family::<mmb::Family, _>(c, "mmb", strategy, PARALLEL_THREADS);
+    bench_family::<mmr::Family, _>(c, name, timed, "mmr", strategy.clone(), PARALLEL_THREADS);
+    bench_family::<mmb::Family, _>(c, name, timed, "mmb", strategy, PARALLEL_THREADS);
+}
+
+fn bench_prover(c: &mut Criterion) {
+    bench_all(c, module_path!(), Timed::Proof);
 }
 
 criterion_group! {
