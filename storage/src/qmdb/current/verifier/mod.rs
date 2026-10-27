@@ -76,28 +76,30 @@
 //!    Authenticate the final `CommitFloor` and the raw append frontier (the nodes
 //!    needed to append to the tree), binding the old floor and log size.
 //! 2. Authenticate every supplied old record, the key claims' and the floor candidates',
-//!    with one shared raw multi-proof against that same opening. Merge only consistent
-//!    claims into the cache. An active record's cyclic successor proves that the open
-//!    interval between the two keys contains no active key; inclusion alone does not make
-//!    a record active, which step 4 establishes.
-//! 3. Classify each requested mutation and derive the application operations,
+//!    with one shared raw multi-proof against that same opening. Inclusion alone does not
+//!    make a record current: a superseded record stays in the log.
+//! 3. Authenticate the supplied bitmap chunks and compressed all-zero intervals; raw and
+//!    grafted proofs jointly authenticate them against the opening. Require every claimed
+//!    record's bit to be set, then merge only consistent claims into the cache. An active
+//!    record's cyclic successor proves that the open interval between the two keys contains
+//!    no active key.
+//! 4. Classify each requested mutation and derive the application operations,
 //!    including predecessor rewrites. The batch keeps delete ranges normalized;
 //!    follow authenticated successor edges through each interval to enumerate every
 //!    deleted member. A range with no lower bound starts at the least key, which the
 //!    greatest key's wrapping successor edge proves. Missing facts cause an error,
 //!    never a guess.
-//! 4. Authenticate every bitmap region needed for invalidations, appends, the floor
-//!    scan, and the claimed records. Exact coverage prevents omitted live bits. Raw and
-//!    grafted proofs jointly authenticate explicit chunks and compressed all-zero
-//!    intervals. Every claimed record's bit must be set.
-//! 5. Require candidate payloads at every set bit in the scan, except the separately
+//! 5. Require the bitmap units to cover exactly the regions needed for invalidations,
+//!    appends, the floor scan, and the claimed records. Exact coverage prevents omitted
+//!    live bits.
+//! 6. Require candidate payloads at every set bit in the scan, except the separately
 //!    authenticated terminal. Replay the caller's floor policy to derive the floor and
 //!    the copies, and require the claimed scan endpoint to match the replay's stopping
 //!    point.
-//! 6. Append the derived operations, clear superseded bits, and recompute affected
+//! 7. Append the derived operations, clear superseded bits, and recompute affected
 //!    Merkle paths using authenticated siblings. Combine all child root components
 //!    and compare both size and root with the claimed post-commitment.
-//! 7. On [`Verified::into_cache`], rebase retained facts through those same
+//! 8. On [`Verified::into_cache`], rebase retained facts through those same
 //!    operations. Remove invalidated absence intervals and replace moved records
 //!    before returning the cache.
 //!

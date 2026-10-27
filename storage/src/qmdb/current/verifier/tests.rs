@@ -399,19 +399,35 @@ fn reject_forgeries<F: Graftable, P: Policy<F, Key, Key> + Clone + Debug>(
         forge_units(forgery, expected, batch, pre, proof, post, policy, change);
     };
     let coverage = [Bitmap(B::Coverage)];
-    forge("a missing bitmap unit", &coverage, &|units| {
-        units.remove(0);
-    });
+    // Units are authenticated before coverage is checked, so a dropped unit can first break the
+    // tree proofs' shape, or leave a claimed record's bit unknown.
+    forge(
+        "a missing bitmap unit",
+        &[
+            Bitmap(B::Coverage),
+            Bitmap(B::ProofShape),
+            Bitmap(B::RawRoot),
+            VerifyError::InactiveClaim,
+        ],
+        &|units| {
+            units.remove(0);
+        },
+    );
     forge("a repeated bitmap unit", &coverage, &|units| {
         units.insert(0, units[0].clone())
     });
-    forge("an extra bitmap unit", &coverage, &|units| {
-        let mut extra = units[units.len() - 1].clone();
-        if let BitmapUnit::ExplicitChunk { chunk_index, .. } = &mut extra {
-            *chunk_index += 1;
-        }
-        units.push(extra);
-    });
+    // A chunk past the last one is out of place; a graftable one must also carry its raw digest.
+    forge(
+        "an extra bitmap unit",
+        &[Bitmap(B::Coverage), Bitmap(B::RawDigest)],
+        &|units| {
+            let mut extra = units[units.len() - 1].clone();
+            if let BitmapUnit::ExplicitChunk { chunk_index, .. } = &mut extra {
+                *chunk_index += 1;
+            }
+            units.push(extra);
+        },
+    );
     if units.len() > 1 {
         forge("reordered bitmap units", &coverage, &|units| {
             units.swap(0, 1)
@@ -438,10 +454,9 @@ fn reject_forgeries<F: Graftable, P: Policy<F, Key, Key> + Clone + Debug>(
         matches!(unit, BitmapUnit::ExplicitChunk { bytes, raw_subtree_digest: Some(_), .. }
             if *bytes != [0; 32])
     }) {
-        // A chunk the transition reads is refused outright; any other fails the grafted root.
         forge(
             "a set chunk claimed clear",
-            &[Bitmap(B::NeedsBytes), Bitmap(B::GraftedRoot)],
+            &[Bitmap(B::GraftedRoot)],
             &|units| {
                 if let BitmapUnit::ExplicitChunk {
                     chunk_index,
@@ -462,8 +477,9 @@ fn reject_forgeries<F: Graftable, P: Policy<F, Key, Key> + Clone + Debug>(
         raw_subtree_digest, ..
     } = units[index]
     {
+        // Its set bit fails the grafted root before coverage is checked.
         let expected = if raw_subtree_digest.is_some() {
-            B::NeedsBytes
+            B::GraftedRoot
         } else {
             B::Ungraftable
         };
@@ -506,15 +522,16 @@ fn reject_zero_subtree_forgeries<F: Graftable>(units: &[Unit<F>], forge: ForgeUn
             common_subtree_digest.0[0] ^= 1;
         }
     });
-    // Doubling a block either breaks its alignment, overruns what it may cover, or leaves the
-    // next unit out of place.
+    // Doubling a block breaks its alignment, overruns the graftable chunks, overlaps the next
+    // unit, or no longer matches the tree proofs, which are checked before coverage.
     forge(
         "a grown zero subtree",
         &[
             Bitmap(B::Coverage),
             Bitmap(B::Misaligned),
             Bitmap(B::Ungraftable),
-            Bitmap(B::NeedsBytes),
+            Bitmap(B::ProofShape),
+            Bitmap(B::RawRoot),
         ],
         &|units| {
             if let BitmapUnit::ZeroSubtree { chunk_height, .. } = &mut units[first] {

@@ -141,11 +141,7 @@ pub enum VerifyError {
     /// The pre-state opening does not authenticate the trusted commitment.
     #[error("invalid pre-state opening")]
     InvalidPreStateOpening,
-    /// A membership claim's location lies outside the pre-state's live operations.
-    #[error("invalid member proof")]
-    InvalidMemberProof,
-    /// An exclusion claim's record does not span its key, or lies outside the pre-state's live
-    /// operations.
+    /// An exclusion claim's owner record does not span its queried key.
     #[error("invalid exclusion proof")]
     InvalidExclusionProof,
     /// The shared record proof is missing, unexpected, bound to another size or floor, or does
