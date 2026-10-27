@@ -14,7 +14,7 @@ use crate::{
     Context,
     index::Ordered as OrderedIndex,
     journal::contiguous::{Contiguous as _, Mutable},
-    merkle::{self, Graftable, Location},
+    merkle::{self, ElementPlan, Graftable, Location, storage::Storage as _},
     qmdb::{
         self,
         any::{
@@ -25,6 +25,7 @@ use crate::{
         current::{
             batch::MerkleizedBatch,
             ordered::{self, proof::constant::ExclusionProof},
+            proof::constant::OperationProof,
         },
         floor::Policy,
         operation::Key,
@@ -294,46 +295,58 @@ impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
             requests.insert(record.1.key.clone(), Request::Member(record));
         }
 
-        futures::stream::iter(requests)
+        // Settle the keys the batch did not reveal, then build every claim's operation proof
+        // together.
+        let requests = futures::stream::iter(requests)
             .map(|(key, request)| async move {
-                let request = match request {
-                    Request::Unknown => match db.any.get_with_loc(&key).await? {
-                        Some((update, location)) => Request::Member((location, update)),
-                        None => Request::Absent,
-                    },
-                    request => request,
-                };
                 Ok::<_, BuildError<F>>(match request {
-                    Request::Member((location, update)) => {
-                        PreStateKeyClaim::Member(PreStateMemberClaim {
-                            proof: ordered::proof::constant::KeyValueProof {
-                                proof: db.operation_proof(location).await?,
-                                next_key: update.next_key,
-                            },
-                            key,
-                            value: update.value,
-                        })
-                    }
-                    Request::Excluded((location, owner)) => {
-                        PreStateKeyClaim::Exclusion(PreStateExclusionClaim {
-                            proof: ExclusionProof::KeyValue(
-                                db.operation_proof(location).await?,
-                                owner,
-                            ),
-                            queried_key: key,
-                        })
-                    }
-                    Request::Absent | Request::Unknown => {
-                        PreStateKeyClaim::Exclusion(PreStateExclusionClaim {
-                            proof: db.exclusion_proof(&key).await?,
-                            queried_key: key,
-                        })
-                    }
+                    Request::Unknown => match db.any.get_with_loc(&key).await? {
+                        Some((update, location)) => (key, Request::Member((location, update))),
+                        None => (key, Request::Absent),
+                    },
+                    request => (key, request),
                 })
             })
             .buffered(db.strategy().manual().parallelism())
-            .try_collect()
-            .await
+            .try_collect::<Vec<_>>()
+            .await?;
+        let locations = requests
+            .iter()
+            .filter_map(|(_, request)| match request {
+                Request::Member((location, _)) | Request::Excluded((location, _)) => {
+                    Some(*location)
+                }
+                Request::Absent | Request::Unknown => None,
+            })
+            .collect::<Vec<_>>();
+        let mut proofs = operation_proofs(db, &locations).await?.into_iter();
+        let missing = || BuildError::InvalidState("an operation proof was not built");
+        let mut claims = Vec::with_capacity(requests.len());
+        for (key, request) in requests {
+            claims.push(match request {
+                Request::Member((_, update)) => PreStateKeyClaim::Member(PreStateMemberClaim {
+                    proof: ordered::proof::constant::KeyValueProof {
+                        proof: proofs.next().ok_or_else(missing)?,
+                        next_key: update.next_key,
+                    },
+                    key,
+                    value: update.value,
+                }),
+                Request::Excluded((_, owner)) => {
+                    PreStateKeyClaim::Exclusion(PreStateExclusionClaim {
+                        proof: ExclusionProof::KeyValue(proofs.next().ok_or_else(missing)?, owner),
+                        queried_key: key,
+                    })
+                }
+                Request::Absent | Request::Unknown => {
+                    PreStateKeyClaim::Exclusion(PreStateExclusionClaim {
+                        proof: db.exclusion_proof(&key).await?,
+                        queried_key: key,
+                    })
+                }
+            });
+        }
+        Ok(claims)
     }
 
     /// Merkleize the same normalized mutations through the ordinary database writer.
@@ -540,6 +553,51 @@ where
         deleted_keys,
         post_empty: batch.inner.total_active_keys == 0,
     })
+}
+
+/// Build the operation proofs of `locations`, in order, together: plan each one, read the
+/// union of the nodes they need in one storage request, and build them on the database's
+/// strategy. Each proof equals the one the database builds for its location alone.
+async fn operation_proofs<F, E, C, K, V, I, H, const N: usize, S>(
+    db: &ordered::db::Db<F, E, C, K, V, I, H, N, S>,
+    locations: &[Location<F>],
+) -> Result<Vec<OperationProof<F, H::Digest, N>>, BuildError<F>>
+where
+    F: Graftable,
+    E: Context,
+    C: Mutable<Item = Operation<F, OrderedUpdate<K, V>>>,
+    K: Key,
+    V: ValueEncoding,
+    I: OrderedIndex<Value = Location<F>>,
+    H: Hasher,
+    S: Strategy,
+    Operation<F, OrderedUpdate<K, V>>: Codec,
+{
+    let storage = db.grafted_storage();
+    let leaves = Location::try_from(storage.size())?;
+    let plans = locations
+        .iter()
+        .map(|&location| ElementPlan::new(leaves, location))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut positions = plans
+        .iter()
+        .flat_map(ElementPlan::positions)
+        .collect::<Vec<_>>();
+    positions.sort_unstable();
+    positions.dedup();
+    let digests = storage.get_nodes(&positions).await?;
+    let node = |position| {
+        positions
+            .binary_search(&position)
+            .ok()
+            .and_then(|index| digests.get(index))
+            .copied()
+    };
+    let status = db.bitmap();
+    let (floor, ops_root) = (db.any.inactivity_floor_loc, db.any.root());
+    Ok(db.strategy().try_map_collect_vec(plans, |plan| {
+        OperationProof::build::<H>(status, plan, node, floor, ops_root)
+    })?)
 }
 
 /// Locate the immediate cyclic predecessor needed when deleting a member.
