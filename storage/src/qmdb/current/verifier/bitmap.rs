@@ -318,14 +318,24 @@ impl<F: Graftable, D: Digest, const N: usize> BitmapUnit<F, D, N> {
     }
 }
 
+/// The half-open chunk interval one bitmap unit covers, and whether it supplied bytes.
+#[derive(Clone, Copy)]
+pub(crate) struct CoveredUnit {
+    start: u64,
+    end: u64,
+    explicit: bool,
+}
+
 /// Checked activity chunks and tree nodes belonging to one authenticated pre-state.
-/// Coverage is complete for the requested scan and mutations, not the whole database.
+/// Every chunk and zero interval here is authenticated, but coverage is complete for the
+/// requested scan and mutations only once [`check_bitmap_coverage`] accepts `units`.
 /// `zero_ranges` use half-open chunk intervals. Node maps use operation-tree positions.
 /// The scan endpoint is bounded here and justified later by deterministic replay.
 pub(crate) struct VerifiedBitmapView<F: Family, D: Digest, const N: usize> {
     pub(crate) floor_scan_end: Location<F>,
     pub(crate) explicit_chunks: BTreeMap<u64, [u8; N]>,
     pub(crate) zero_ranges: Vec<(u64, u64)>,
+    pub(crate) units: Vec<CoveredUnit>,
     pub(crate) raw_nodes: BTreeMap<Position<F>, D>,
     pub(crate) grafted_nodes: BTreeMap<Position<F>, D>,
 }
@@ -377,7 +387,7 @@ impl<F: Family, D: Digest, const N: usize> VerifiedBitmapView<F, D, N> {
 ///
 /// Floor replay needs complete scan coverage to detect every live candidate. Root
 /// reconstruction needs full bytes for changed old chunks to preserve unrelated bits.
-/// This helper determines those requirements before inspecting the supplied units.
+/// This helper derives those requirements from the transition alone, never from the units.
 ///
 /// Cover the proposed floor scan, every superseded or claimed record, and the old terminal.
 /// Force scan-boundary chunks to be explicit when the boundary cuts a chunk. Also
@@ -480,15 +490,17 @@ pub(crate) fn set_chunk_bit<const N: usize>(
     Ok(())
 }
 
-/// Authenticate exact bitmap coverage and sparse-tree siblings for this transition.
+/// Authenticate the supplied bitmap chunks, zero subtrees, and sparse-tree siblings.
 ///
-/// The returned view supplies the candidate locations for floor replay and the old
-/// bits and Merkle siblings for root reconstruction. Checking both coverage and
-/// contents prevents a bundle from hiding live candidates or changing unrelated bits.
+/// The returned view supplies activity bits for the claimed records, the candidate locations
+/// for floor replay, and the old bits and Merkle siblings for root reconstruction. This
+/// stage needs nothing derived from the batch, so the verifier can read claimed records'
+/// bits before it trusts their contents. [`check_bitmap_coverage`] later requires the units
+/// to cover exactly what the transition needs, which prevents a bundle from hiding live
+/// candidates or changing unrelated bits.
 ///
-/// Require units to partition the requested chunk intervals in order, without gaps,
-/// overlaps, or extras. Explicit chunks provide bytes. Zero subtrees must be aligned,
-/// complete, graftable, and avoid every chunk whose bytes will be read or changed.
+/// Require units in increasing chunk order without overlaps. Explicit chunks provide
+/// bytes. Zero subtrees must be aligned, complete, and graftable.
 /// For each graftable explicit chunk, authenticate raw digest `r` in the raw tree and
 /// its prescribed bitmap transform in the grafted tree. A zero subtree supplies the
 /// same digest to both proofs: under the hash binding assumption and a valid Current
@@ -498,17 +510,14 @@ pub(crate) fn set_chunk_bit<const N: usize>(
 ///
 /// Authenticate the grafted append frontier by reconstructing its root and merge it
 /// with the proof paths, rejecting conflicting nodes. The raw frontier was verified
-/// by the opening. This check authenticates coverage and bits for the claimed scan
-/// interval. `advance_floor` must still check its endpoint against deterministic replay.
+/// by the opening. `advance_floor` must still check the scan endpoint against
+/// deterministic replay.
 /// For `u` units, `e` of them explicit, and Merkle height `h`, worst-case CPU is
-/// O(k * log(k + 2) + (u + 1) * h * log((u + 1) * h + 2) + e * N), and temporary
-/// memory is O(k + (u + 1) * h + e * N). Here k bounds superseded locations. Zero
-/// subtrees are processed by their endpoints and Merkle paths, not by scanning all
-/// covered bits. Explicit chunks must be read and hashed in full.
+/// O((u + 1) * h * log((u + 1) * h + 2) + e * N), and temporary memory is
+/// O(u + (u + 1) * h + e * N). Zero subtrees are processed by their endpoints and Merkle
+/// paths, not by scanning all covered bits. Explicit chunks must be read and hashed in full.
 pub(crate) fn verify_bitmap<F, K, V, H, const N: usize, S: Strategy>(
     pre: &AuthenticatedPreState<F, K, V, H, N>,
-    prepared: &PreparedOrderedBatch<F, K, V>,
-    claimed: &BTreeSet<Location<F>>,
     proof: &BitmapProof<F, H::Digest, N>,
     strategy: &S,
 ) -> Result<VerifiedBitmapView<F, H::Digest, N>, VerifyError>
@@ -528,20 +537,8 @@ where
     if floor_scan_end < pre.old_floor || floor_scan_end > pre.commitment.size() {
         return Err(BitmapFault::ScanBounds.into());
     }
-    let complete_chunks = pre.commitment.size().as_u64() / chunk_bits;
-    let graftable_chunks =
-        grafting::graftable_chunks::<F>(pre.commitment.size().as_u64(), grafting_height)
-            .min(complete_chunks);
+    let (complete_chunks, graftable_chunks) = chunk_counts::<F, N>(pre.commitment.size());
     let partial_chunk = pre.commitment.size().as_u64() % chunk_bits;
-    let (required, forced_explicit) = required_chunk_intervals(
-        pre.commitment.size(),
-        pre.old_floor,
-        floor_scan_end,
-        prepared,
-        claimed,
-        chunk_bits,
-        graftable_chunks,
-    );
     let Some(proven) = proven else {
         let mut chunk = BitMap::<N>::EMPTY_CHUNK;
         set_chunk_bit(&mut chunk, 0, true)?;
@@ -549,6 +546,7 @@ where
             floor_scan_end,
             explicit_chunks: BTreeMap::from([(0, chunk)]),
             zero_ranges: Vec::new(),
+            units: Vec::new(),
             raw_nodes: pre.raw_frontier.clone(),
             grafted_nodes: pre.raw_frontier.clone(),
         });
@@ -558,23 +556,21 @@ where
     }
     let mut explicit_chunks = BTreeMap::new();
     let mut zero_ranges = Vec::new();
+    let mut units = Vec::with_capacity(proven.units.len());
     let mut raw_targets = Vec::new();
     let mut grafted_targets = Vec::new();
     let merkle_hasher = qmdb::hasher::<H>();
 
-    let mut interval_index = 0usize;
-    let mut cursor = required.first().map_or(0, |interval| interval.0);
+    // The first chunk the next unit may cover; ordering makes chunk indexes unique.
+    let mut next = 0u64;
     for unit in &proven.units {
-        let Some((_, required_end)) = required.get(interval_index).copied() else {
-            return Err(BitmapFault::Coverage.into());
-        };
         match unit {
             BitmapUnit::ExplicitChunk {
                 chunk_index,
                 bytes,
                 raw_subtree_digest,
             } => {
-                if *chunk_index != cursor {
+                if *chunk_index < next {
                     return Err(BitmapFault::Coverage.into());
                 }
                 let expected_raw = *chunk_index < graftable_chunks;
@@ -627,9 +623,13 @@ where
                         digest: grafted_digest,
                     });
                 }
-                // Exact coverage makes chunk indexes unique.
                 explicit_chunks.insert(*chunk_index, *bytes);
-                cursor = cursor.checked_add(1).ok_or(VerifyError::Overflow)?;
+                next = chunk_index.checked_add(1).ok_or(VerifyError::Overflow)?;
+                units.push(CoveredUnit {
+                    start: *chunk_index,
+                    end: next,
+                    explicit: true,
+                });
             }
             BitmapUnit::ZeroSubtree {
                 first_chunk,
@@ -643,7 +643,7 @@ where
                 let end = first_chunk
                     .checked_add(width)
                     .ok_or(VerifyError::Overflow)?;
-                if *first_chunk != cursor || end > required_end {
+                if *first_chunk < next {
                     return Err(BitmapFault::Coverage.into());
                 }
                 if !first_chunk.is_multiple_of(width) {
@@ -652,10 +652,7 @@ where
                 if end > graftable_chunks {
                     return Err(BitmapFault::Ungraftable.into());
                 }
-                if forced_explicit.range(*first_chunk..end).next().is_some() {
-                    return Err(BitmapFault::NeedsBytes.into());
-                }
-                // The bounded chunk interval also bounds its height and operation locations.
+                // The graftable bound also bounds its height and operation locations.
                 let height = grafting_height + chunk_height;
                 let leaf_start = first_chunk * chunk_bits;
                 let target = SubtreeTarget {
@@ -666,18 +663,14 @@ where
                 raw_targets.push(target);
                 grafted_targets.push(target);
                 zero_ranges.push((*first_chunk, end));
-                cursor = end;
+                next = end;
+                units.push(CoveredUnit {
+                    start: *first_chunk,
+                    end,
+                    explicit: false,
+                });
             }
         }
-        if cursor == required_end {
-            interval_index += 1;
-            if let Some((start, _)) = required.get(interval_index) {
-                cursor = *start;
-            }
-        }
-    }
-    if interval_index != required.len() {
-        return Err(BitmapFault::Coverage.into());
     }
 
     let raw_inactive = F::inactive_peaks(pre.commitment.size(), pre.old_floor);
@@ -759,9 +752,77 @@ where
         floor_scan_end,
         explicit_chunks,
         zero_ranges,
+        units,
         raw_nodes,
         grafted_nodes,
     })
+}
+
+/// Require the authenticated units to cover exactly the chunks this transition needs.
+///
+/// Floor replay needs complete scan coverage to detect every live candidate, and root
+/// reconstruction needs the bytes of every changed chunk. Require the units to partition
+/// the [`required_chunk_intervals`] in order, without gaps, overlaps, or extras, and every
+/// zero subtree to avoid each chunk whose bytes will be read or changed. CPU is
+/// O(k * log(k + 2) + u) for `k` superseded and claimed locations and `u` units.
+pub(crate) fn check_bitmap_coverage<F, K, V, H, const N: usize>(
+    pre: &AuthenticatedPreState<F, K, V, H, N>,
+    prepared: &PreparedOrderedBatch<F, K, V>,
+    claimed: &BTreeSet<Location<F>>,
+    bitmap: &VerifiedBitmapView<F, H::Digest, N>,
+) -> Result<(), VerifyError>
+where
+    F: Graftable,
+    K: Key,
+    V: ValueEncoding,
+    H: Hasher,
+{
+    if pre.initial {
+        return Ok(());
+    }
+    let (_, graftable_chunks) = chunk_counts::<F, N>(pre.commitment.size());
+    let (required, forced_explicit) = required_chunk_intervals(
+        pre.commitment.size(),
+        pre.old_floor,
+        bitmap.floor_scan_end,
+        prepared,
+        claimed,
+        BitMap::<N>::CHUNK_SIZE_BITS,
+        graftable_chunks,
+    );
+    let mut intervals = required.iter();
+    let mut current = intervals.next();
+    let mut cursor = current.map_or(0, |interval| interval.0);
+    for unit in &bitmap.units {
+        let Some((_, required_end)) = current.copied() else {
+            return Err(BitmapFault::Coverage.into());
+        };
+        if unit.start != cursor || unit.end > required_end {
+            return Err(BitmapFault::Coverage.into());
+        }
+        if !unit.explicit && forced_explicit.range(unit.start..unit.end).next().is_some() {
+            return Err(BitmapFault::NeedsBytes.into());
+        }
+        cursor = unit.end;
+        if cursor == required_end {
+            current = intervals.next();
+            if let Some((start, _)) = current {
+                cursor = *start;
+            }
+        }
+    }
+    if current.is_some() {
+        return Err(BitmapFault::Coverage.into());
+    }
+    Ok(())
+}
+
+/// The pre-state's complete chunks, and how many of them are graftable.
+fn chunk_counts<F: Graftable, const N: usize>(size: Location<F>) -> (u64, u64) {
+    let complete = size.as_u64() / BitMap::<N>::CHUNK_SIZE_BITS;
+    let graftable =
+        grafting::graftable_chunks::<F>(size.as_u64(), grafting::height::<N>()).min(complete);
+    (complete, graftable)
 }
 
 #[cfg(test)]
@@ -828,6 +889,7 @@ mod tests {
             floor_scan_end: Location::new(32),
             explicit_chunks: BTreeMap::from([(0, [0b0000_0101]), (3, [0b1000_0000])]),
             zero_ranges: vec![(1, 3)],
+            units: Vec::new(),
             raw_nodes: BTreeMap::new(),
             grafted_nodes: BTreeMap::new(),
         };

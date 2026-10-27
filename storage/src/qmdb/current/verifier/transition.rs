@@ -8,13 +8,13 @@ use super::{
     BatchProofBundle, CurrentCommitment,
     OptionTrusted::KnownTrusted,
     PartialTrustedState, TrustedEntry, TrustedMap, TrustedState, UserBatch, UserOp, VerifyError,
-    bitmap::verify_bitmap,
+    bitmap::{check_bitmap_coverage, verify_bitmap},
     commitment::validate_profile,
     floor::{FloorResult, advance_floor, verify_candidates},
     opening::authenticate_pre_state,
     ordered::{
-        PreparedOrderedBatch, authenticate_and_merge_records, check_claim_activity,
-        derive_ordered_transition, expand_range_deletes,
+        PreparedOrderedBatch, authenticate_records, derive_ordered_transition,
+        expand_range_deletes, merge_active_claims,
     },
     root::derive_child_commitment,
 };
@@ -241,9 +241,9 @@ where
 
 /// Verify one transition, and return it with the facts it established at the parent.
 ///
-/// Require the cache to already be bound to `pre_commitment`. Authenticate the opening and
-/// key claims, derive ordered operations, authenticate scan coverage and payloads,
-/// and replay floor advancement. Reconstruct the child root from those results.
+/// Require the cache to already be bound to `pre_commitment`. Authenticate the opening, the
+/// supplied records, and the bitmap, merge the active key claims, derive ordered operations,
+/// check scan coverage and payloads, and replay floor advancement. Reconstruct the child root from those results.
 /// Comparing the derived bounds and commitment with the claims establishes that the
 /// claimed transition follows from the authorized batch, including floor movement.
 /// Only after all comparisons succeed is the transition returned.
@@ -307,18 +307,18 @@ where
     {
         return Err(VerifyError::InvalidTrustedState);
     }
-    let claimed = authenticate_and_merge_records(
+    let records = authenticate_records(
         &pre,
-        &mut cache,
         &proof_bundle.pre_state_claims,
         &proof_bundle.pre_state_candidates.operations,
         proof_bundle.records_proof.as_ref(),
     )?;
+    let bitmap = verify_bitmap(&pre, &proof_bundle.bitmap, strategy)?;
+    // Inclusion alone does not make a record current: merge only claims the bitmap shows active.
+    let claimed = merge_active_claims(&mut cache, &bitmap, records)?;
     let points = expand_range_deletes(&cache, batch.ops())?;
     let prepared = derive_ordered_transition(&cache, &points)?;
-    let bitmap = verify_bitmap(&pre, &prepared, &claimed, &proof_bundle.bitmap, strategy)?;
-    // Inclusion alone admitted the claimed records; only active ones may stand.
-    check_claim_activity(&bitmap, &claimed)?;
+    check_bitmap_coverage(&pre, &prepared, &claimed, &bitmap)?;
     let candidates =
         verify_candidates(&pre, &bitmap, &proof_bundle.pre_state_candidates)?;
     let floor = advance_floor(

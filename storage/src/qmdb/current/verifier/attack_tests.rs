@@ -5,11 +5,11 @@ use super::{
     BitmapFault, BitmapProof, CandidateFault, CurrentCommitment, PreStateCandidateProof,
     PreStateExclusionClaim, PreStateKeyClaim, PreStateMemberClaim, TrustedMap, UserBatch,
     VerifyError,
-    bitmap::build_bitmap_proof,
+    bitmap::{build_bitmap_proof, verify_bitmap},
     floor::check_policy,
     ordered::{
-        PreparedOrderedBatch, authenticate_and_merge_records, derive_ordered_transition,
-        expand_range_deletes,
+        PreparedOrderedBatch, authenticate_records, derive_ordered_transition,
+        expand_range_deletes, merge_active_claims,
     },
     opening::authenticate_pre_state,
 };
@@ -271,6 +271,154 @@ fn mmb_stale_record_is_not_a_member() {
     stale_record_is_not_a_member::<mmb::Family>();
 }
 
+/// Claims need no location bounds of their own. A genuine record below the old floor is in the
+/// log, so the shared proof covers it, but no bit below the floor is set. The terminal is a
+/// commit, so no key record matches it.
+fn records_outside_the_live_range_are_rejected<F: Graftable>() {
+    let executor = deterministic::Runner::default();
+    executor.start(|context| async move {
+        let (db, old_loc, old_next) = with_superseded_record::<F>(context, 3).await;
+        let pre = commitment(&db);
+        assert!(old_loc < db.inactivity_floor_loc());
+        let batch = Batch::from([UserBatchOp::set_value(3, 301)]);
+        let (honest, merkleized) = batch.prove(&db, &mut Proportional).await.unwrap();
+        let post =
+            Commitment::<F>::from_parts(merkleized.bounds().tip.size, merkleized.root()).unwrap();
+        batch
+            .verify(pre, TrustedMap::empty_cache(pre), &honest, post, &mut Proportional)
+            .unwrap();
+
+        let mut forged = honest.clone();
+        forged.pre_state_claims = vec![PreStateKeyClaim::Member(PreStateMemberClaim {
+            location: old_loc,
+            key: key(3),
+            value: key(3),
+            next_key: old_next,
+        })];
+        reprove_records(&db, &mut forged).await;
+        reject(
+            "a record below the floor as a member",
+            &batch,
+            pre,
+            &forged,
+            post,
+            &[VerifyError::InactiveClaim],
+        );
+
+        let mut forged = honest.clone();
+        forged.pre_state_claims = vec![PreStateKeyClaim::Member(PreStateMemberClaim {
+            location: pre.size() - 1,
+            key: key(3),
+            value: key(300),
+            next_key: key(4),
+        })];
+        reprove_records(&db, &mut forged).await;
+        reject(
+            "the terminal as a member",
+            &batch,
+            pre,
+            &forged,
+            post,
+            &[VerifyError::InvalidRecordProof],
+        );
+        db.destroy().await.unwrap();
+    });
+}
+
+#[test]
+fn mmr_records_outside_the_live_range_are_rejected() {
+    records_outside_the_live_range_are_rejected::<mmr::Family>();
+}
+
+#[test]
+fn mmb_records_outside_the_live_range_are_rejected() {
+    records_outside_the_live_range_are_rejected::<mmb::Family>();
+}
+
+/// Far below the floor, in a complete graftable chunk, the grafted tree authenticates a genuine
+/// old record's bit as clear even when the bundle supplies that chunk's bytes.
+fn a_graftable_record_below_the_floor_is_not_a_member<F: Graftable>() {
+    let executor = deterministic::Runner::default();
+    executor.start(|context| async move {
+        let db = open::<F>(context).await;
+        let mut db = apply(db, &Batch::from_iter((1..=8).map(UserBatchOp::set))).await;
+        let (old, old_loc) = db.any.get_with_loc(&key(3)).await.unwrap().unwrap();
+        for round in 1..=100 {
+            let rewrite = (1..=8).map(|i| UserBatchOp::set_value(i, 1000 * round + i));
+            db = apply(db, &Batch::from_iter(rewrite)).await;
+        }
+        let pre = commitment(&db);
+        let old_chunk = *old_loc / 256;
+        assert!(*db.inactivity_floor_loc() >= 2 * 256, "the floor must pass the old chunk");
+        let batch = Batch::from([UserBatchOp::set_value(3, 301)]);
+        let (honest, merkleized) = batch.prove(&db, &mut Proportional).await.unwrap();
+        let post =
+            Commitment::<F>::from_parts(merkleized.bounds().tip.size, merkleized.root()).unwrap();
+        batch
+            .verify(pre, TrustedMap::empty_cache(pre), &honest, post, &mut Proportional)
+            .unwrap();
+
+        let mut forged = honest.clone();
+        forged.pre_state_claims = vec![PreStateKeyClaim::Member(PreStateMemberClaim {
+            location: old_loc,
+            key: key(3),
+            value: old.value,
+            next_key: old.next_key,
+        })];
+        reprove_records(&db, &mut forged).await;
+        let BitmapProof::Proven(bitmap) = &honest.bitmap else {
+            panic!("expected a proven bitmap");
+        };
+        let superseded = PreparedOrderedBatch {
+            application_ops: Vec::new(),
+            superseded: BTreeSet::from([old_loc]),
+            deleted_keys: BTreeSet::new(),
+            post_empty: false,
+        };
+        let grafted_storage = db.grafted_storage();
+        forged.bitmap = build_bitmap_proof::<F, Key, FixedEncoding<Key>, Sha256, _, _, _, 32>(
+            pre.size(),
+            honest.claims.pre_floor,
+            bitmap.floor_scan_end,
+            &superseded,
+            &claimed(&forged.pre_state_claims),
+            db.bitmap(),
+            &db.any.log.merkle,
+            &grafted_storage,
+        )
+        .await
+        .unwrap();
+        drop(grafted_storage);
+        let BitmapProof::Proven(covered) = &forged.bitmap else {
+            panic!("expected a proven bitmap");
+        };
+        assert!(covered.units.iter().any(|unit| matches!(
+            unit,
+            super::BitmapUnit::ExplicitChunk { chunk_index, raw_subtree_digest: Some(_), .. }
+                if *chunk_index == old_chunk
+        )));
+        reject(
+            "a graftable record below the floor as a member",
+            &batch,
+            pre,
+            &forged,
+            post,
+            &[VerifyError::InactiveClaim],
+        );
+        db.destroy().await.unwrap();
+    });
+}
+
+#[test]
+fn mmr_a_graftable_record_below_the_floor_is_not_a_member() {
+    a_graftable_record_below_the_floor_is_not_a_member::<mmr::Family>();
+}
+
+#[test]
+fn mmb_a_graftable_record_below_the_floor_is_not_a_member() {
+    a_graftable_record_below_the_floor_is_not_a_member::<mmb::Family>();
+}
+
 /// A bundle whose bitmap coverage and candidates are genuine for a shorter scan than the floor
 /// policy requires hides live records from the floor walk; replay notices.
 fn a_shortened_scan_is_rejected<F: Graftable>() {
@@ -298,14 +446,15 @@ fn a_shortened_scan_is_rejected<F: Graftable>() {
         // Rebuild the pre-state exactly as the prover does, then re-cover a shorter scan.
         let pre_state = authenticate_pre_state(pre, &honest.pre_state).unwrap();
         let mut cache = TrustedMap::empty_cache(pre);
-        let claims = authenticate_and_merge_records(
+        let records = authenticate_records(
             &pre_state,
-            &mut cache,
             &honest.pre_state_claims,
             &honest.pre_state_candidates.operations,
             honest.records_proof.as_ref(),
         )
         .unwrap();
+        let view = verify_bitmap(&pre_state, &honest.bitmap, &Sequential).unwrap();
+        let claims = merge_active_claims(&mut cache, &view, records).unwrap();
         let points = expand_range_deletes(&cache, batch.ops()).unwrap();
         let prepared = derive_ordered_transition(&cache, &points).unwrap();
         check_policy::<F, Key, Key, _>(&Proportional, prepared.made_inactive()).unwrap();
