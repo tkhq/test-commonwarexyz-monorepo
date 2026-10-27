@@ -87,6 +87,8 @@ arbitrary = [
 	"dep:arbitrary",
 ]
 fuzzing = [ "test-utils" ]
+# Verify every proof bundle the prover builds before returning it.
+prover-self-check = [ "std" ]
 test-utils = []
 test-traits = []
 
