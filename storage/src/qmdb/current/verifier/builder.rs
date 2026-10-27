@@ -1,14 +1,22 @@
 //! Proof production from a committed storage-backed ordered Current database.
 
+#[cfg(not(feature = "prover-self-check"))]
+use super::ordered::merge_trusted_claims;
+#[cfg(feature = "prover-self-check")]
+use super::{
+    bitmap::verify_bitmap,
+    floor::{advance_floor, verify_candidates},
+    opening::authenticate_pre_state,
+    ordered::verify_and_merge_claims,
+};
 use super::{
     BatchProofBundle, BuildError, ClaimedBatchBounds, CurrentCommitment, PreStateCandidateProof,
     PreStateExclusionClaim, PreStateKeyClaim, PreStateMemberClaim, PreStateOpeningClaim,
-    PreStateTerminalClaim, TrustedMap, UserBatch, UserOp,
-    bitmap::{build_bitmap_proof, verify_bitmap},
+    PreStateTerminalClaim, TrustedMap, UserBatch, UserOp, VerifyError,
+    bitmap::build_bitmap_proof,
     commitment::validate_profile,
-    floor::{advance_floor, check_policy, verify_candidates, walk_floor},
-    opening::authenticate_pre_state,
-    ordered::{derive_ordered_transition, expand_range_deletes, verify_and_merge_claims},
+    floor::{check_policy, walk_floor},
+    ordered::{PreparedOrderedBatch, derive_ordered_transition, expand_range_deletes},
 };
 use crate::{
     Context,
@@ -50,6 +58,8 @@ impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
     /// corresponding batch is merkleized.
     /// The recipient must still call `verify` with its trusted pre-commitment and the
     /// proposed post-commitment; proof construction does not authorize a transition.
+    /// With the `prover-self-check` feature the bundle is also verified before it is returned;
+    /// otherwise the prover trusts its own database and the recipient's check is the only one.
     ///
     /// `policy` must be the floor policy [`merkleize`](Self::merkleize) will use, in the same
     /// state. Proof construction walks a copy of it, so the caller's policy does not change.
@@ -108,6 +118,7 @@ impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
         validate_profile::<H, N>();
         let commitment = CurrentCommitment::from_parts(db.bounds().end, db.root())?;
         let (pre_state, old_floor) = build_opening(db, commitment).await?;
+        #[cfg(feature = "prover-self-check")]
         let pre = authenticate_pre_state(commitment, &pre_state)?;
         let expanded = self.expand_from_db(db).await?;
         // Lower endpoints establish where each authenticated range walk must begin,
@@ -173,17 +184,21 @@ impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
             .try_collect::<Vec<_>>()
             .await?;
         let mut cache = TrustedMap::empty_cache(commitment);
-        if pre.old_floor == pre.terminal_location {
+        if old_floor == commitment.size() - 1 {
             cache.set_state(super::TrustedState::EmptyDatabase);
         }
+        #[cfg(feature = "prover-self-check")]
         verify_and_merge_claims(&pre, &mut cache, &pre_state_claims, db.strategy())?;
+        #[cfg(not(feature = "prover-self-check"))]
+        merge_trusted_claims(&mut cache, &pre_state_claims)?;
         let points = expand_range_deletes(&cache, self.ops())?;
         let prepared = derive_ordered_transition(&cache, &points)?;
         check_policy(policy, prepared.made_inactive())
             .map_err(|_| BuildError::UnsupportedFloorPolicy)?;
-        let (scan_end, candidates) =
+        let walked =
             build_candidate_proof(db, &prepared, commitment.size(), old_floor, policy.clone())
                 .await?;
+        let (scan_end, candidates) = (walked.scan_end, walked.proof);
         let bitmap = build_bitmap_proof::<F, K, V, H, _, _, _, N>(
             commitment.size(),
             old_floor,
@@ -194,22 +209,31 @@ impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
             &db.grafted_storage(),
         )
         .await?;
-        let view = verify_bitmap(&pre, &prepared, &bitmap, db.strategy())?;
-        let verified = verify_candidates(&pre, &view, &candidates)?;
-        let floor = advance_floor(
-            &pre,
-            &prepared,
-            &view,
-            &verified,
-            self.metadata().cloned(),
-            &mut policy.clone(),
-        )?;
+        let post_size = child_size(commitment.size(), &prepared, walked.copies)?;
+        #[cfg(feature = "prover-self-check")]
+        {
+            let view = verify_bitmap(&pre, &prepared, &bitmap, db.strategy())?;
+            let verified = verify_candidates(&pre, &view, &candidates)?;
+            let floor = advance_floor(
+                &pre,
+                &prepared,
+                &view,
+                &verified,
+                self.metadata().cloned(),
+                &mut policy.clone(),
+            )?;
+            if floor.child_size != post_size || floor.floor != walked.floor {
+                return Err(BuildError::InvalidState(
+                    "the prover's floor walk differs from the verifier's",
+                ));
+            }
+        }
         Ok(BatchProofBundle::new(
             ClaimedBatchBounds {
                 pre_size: commitment.size(),
                 pre_floor: old_floor,
-                post_size: floor.child_size,
-                post_floor: floor.floor,
+                post_size,
+                post_floor: walked.floor,
             },
             pre_state,
             pre_state_claims,
@@ -404,6 +428,32 @@ where
     ))
 }
 
+/// The child's size: the application operations, the floor walk's `copies`, and the terminal
+/// commit appended to the pre-state's `base_size` operations.
+fn child_size<F: Graftable, K: Key, V: ValueEncoding>(
+    base_size: Location<F>,
+    prepared: &PreparedOrderedBatch<F, K, V>,
+    copies: usize,
+) -> Result<Location<F>, BuildError<F>> {
+    u64::try_from(prepared.application_ops.len())
+        .ok()
+        .and_then(|operations| operations.checked_add(u64::try_from(copies).ok()?))
+        .and_then(|appended| base_size.checked_add(appended)?.checked_add(1))
+        .ok_or(BuildError::Inconsistent(VerifyError::Overflow))
+}
+
+/// Floor candidates read for one batch, and what the floor walk over them decided.
+struct CandidateEvidence<F: Graftable, K: Key, V: ValueEncoding, D: commonware_cryptography::Digest> {
+    /// The end of the old-log coverage the walk consumed.
+    scan_end: Location<F>,
+    /// The child's inactivity floor.
+    floor: Location<F>,
+    /// The number of live records the walk copies to the tip.
+    copies: usize,
+    /// The candidates' payloads and their raw multi-proof.
+    proof: PreStateCandidateProof<F, K, V, D>,
+}
+
 /// Read old active records through the floor scan's required stopping point.
 /// Include superseded records too: their pre-state bits remain set until replay.
 /// Read as many live records as the floor policy's entry limit allows, then keep those
@@ -416,7 +466,7 @@ async fn build_candidate_proof<F, E, C, K, V, I, H, P, const N: usize, S>(
     pre_size: Location<F>,
     old_floor: Location<F>,
     mut policy: P,
-) -> Result<(Location<F>, PreStateCandidateProof<F, K, V, H::Digest>), BuildError<F>>
+) -> Result<CandidateEvidence<F, K, V, H::Digest>, BuildError<F>>
 where
     F: Graftable,
     E: Context,
@@ -430,13 +480,16 @@ where
     Operation<F, OrderedUpdate<K, V>>: Codec,
 {
     if prepared.post_empty {
-        return Ok((
-            old_floor,
-            PreStateCandidateProof {
+        // The child is empty: its floor is the terminal, right after the application operations.
+        return Ok(CandidateEvidence {
+            scan_end: old_floor,
+            floor: child_size(pre_size, prepared, 0)? - 1,
+            copies: 0,
+            proof: PreStateCandidateProof {
                 operations: Vec::new(),
                 raw_multi_proof: None,
             },
-        ));
+        });
     }
 
     // Read ahead as many live records as the policy's entries allow, then let the walk itself
@@ -517,11 +570,13 @@ where
             .await?,
         )
     };
-    Ok((
-        floor_scan_end,
-        PreStateCandidateProof {
+    Ok(CandidateEvidence {
+        scan_end: floor_scan_end,
+        floor: walked.floor,
+        copies: walked.copies.len(),
+        proof: PreStateCandidateProof {
             operations,
             raw_multi_proof,
         },
-    ))
+    })
 }
