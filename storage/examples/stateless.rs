@@ -107,8 +107,7 @@ async fn run<F: Graftable>(context: deterministic::Context) {
     let mut pre = Commitment::<F>::from_parts(db.bounds().end, db.root()).unwrap();
     let mut cache = TrustedMap::empty_cache(pre);
     for batch in batches() {
-        let proof = batch.build_batch_proof(&db, &Proportional).await.unwrap();
-        let merkleized = batch.merkleize(&db, &mut Proportional).await.unwrap();
+        let (proof, merkleized) = batch.prove(&db, &mut Proportional).await.unwrap();
         let post =
             Commitment::<F>::from_parts(merkleized.bounds().tip.size, merkleized.root()).unwrap();
         let (proof_bytes, post_bytes) = (proof.encode(), post.encode());

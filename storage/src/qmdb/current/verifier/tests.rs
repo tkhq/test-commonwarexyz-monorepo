@@ -799,7 +799,11 @@ where
     let mut commitments = Vec::new();
     for batch in batches {
         let proof = batch.build_batch_proof(&db, &writer_policy).await.unwrap();
+        // Proving merkleizes the batch the writer does, and builds the bundle it is sent with.
+        let (proved, proved_batch) = batch.prove(&db, &mut writer_policy.clone()).await.unwrap();
         let merkleized = batch.merkleize(&db, &mut writer_policy).await.unwrap();
+        assert_eq!(proved_batch.root(), merkleized.root());
+        assert_eq!(round_trip(&proved).encode(), proof.encode());
         let post =
             Commitment::<F>::from_parts(merkleized.bounds().tip.size, merkleized.root()).unwrap();
         probe(&batch, pre, &proof, post);
@@ -1377,10 +1381,12 @@ fn assert_prover_futures_are_send<F: Graftable, S: Strategy, P>(
     variable: &VariableDb<F, S>,
     batch: &Batch,
     values: &UserBatch<Key, Vec<u8>>,
-    policy: &P,
+    policy: &mut P,
 ) where
     P: Policy<F, Key, Key> + Policy<F, Key, Vec<u8>> + Clone + Send,
 {
+    assert_send(batch.prove(fixed, policy));
     assert_send(batch.build_batch_proof(fixed, policy));
+    assert_send(values.prove(variable, policy));
     assert_send(values.build_batch_proof(variable, policy));
 }
