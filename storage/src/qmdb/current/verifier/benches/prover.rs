@@ -1,7 +1,8 @@
 //! Criterion measurements for complete proof construction.
 //!
-//! The timed operation is `UserBatch::build_batch_proof` only, or with [`Timed::Step`] the proof
-//! and the merkleized batch a writer sends and applies. Database initialization, the seeded
+//! The timed operation is `UserBatch::build_batch_proof`, or with [`Timed::Step`] `UserBatch::prove`,
+//! which returns the proof and the merkleized batch a writer sends and applies. Both merkleize the
+//! batch: `build_batch_proof` drops it. Database initialization, the seeded
 //! bootstrap, batch generation, and runtime setup are outside the timer. The database uses the
 //! Tokio storage backend and `EightCap`, with Sequential or Rayon workers.
 
@@ -25,7 +26,7 @@ use std::{
 pub(crate) enum Timed {
     /// Build the proof bundle.
     Proof,
-    /// Build the proof bundle and the merkleized batch.
+    /// Build the proof bundle and keep the merkleized batch.
     Step,
 }
 
@@ -66,21 +67,21 @@ pub(crate) fn bench_family<F: Graftable, S: Strategy>(
                                     for iters in requests {
                                         let start = Instant::now();
                                         for _ in 0..iters {
-                                            black_box(
-                                                fixture
-                                                    .batch
-                                                    .build_batch_proof(&fixture.database, &Proportional)
-                                                    .await
-                                                    .unwrap(),
-                                            );
-                                            if matches!(timed, Timed::Step) {
-                                                black_box(
+                                            match timed {
+                                                Timed::Proof => drop(black_box(
                                                     fixture
                                                         .batch
-                                                        .merkleize(&fixture.database, &mut Proportional)
+                                                        .build_batch_proof(&fixture.database, &Proportional)
                                                         .await
                                                         .unwrap(),
-                                                );
+                                                )),
+                                                Timed::Step => drop(black_box(
+                                                    fixture
+                                                        .batch
+                                                        .prove(&fixture.database, &mut Proportional)
+                                                        .await
+                                                        .unwrap(),
+                                                )),
                                             }
                                         }
                                         results.send(start.elapsed()).unwrap();

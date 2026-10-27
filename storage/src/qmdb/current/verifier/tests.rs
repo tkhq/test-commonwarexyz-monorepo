@@ -799,7 +799,11 @@ where
     let mut commitments = Vec::new();
     for batch in batches {
         let proof = batch.build_batch_proof(&db, &writer_policy).await.unwrap();
+        // Proving merkleizes the batch the writer does, and builds the bundle it is sent with.
+        let (proved, proved_batch) = batch.prove(&db, &mut writer_policy.clone()).await.unwrap();
         let merkleized = batch.merkleize(&db, &mut writer_policy).await.unwrap();
+        assert_eq!(proved_batch.root(), merkleized.root());
+        assert_eq!(round_trip(&proved).encode(), proof.encode());
         let post =
             Commitment::<F>::from_parts(merkleized.bounds().tip.size, merkleized.root()).unwrap();
         probe(&batch, pre, &proof, post);
