@@ -410,13 +410,14 @@ const MOVED_SCAN_END: &[VerifyError] = &[
     VerifyError::InvalidCandidates(CandidateFault::EmptiedScan),
 ];
 
-/// Doubling a block breaks its alignment, overruns what it may cover, or leaves the next unit
-/// out of place.
+/// Doubling a block breaks its alignment, overruns the graftable chunks, overlaps the next unit,
+/// or no longer matches the tree proofs, which are checked before coverage.
 const GROWN_ZERO_SUBTREE: &[VerifyError] = &[
     VerifyError::InvalidBitmapProof(BitmapFault::Coverage),
     VerifyError::InvalidBitmapProof(BitmapFault::Misaligned),
     VerifyError::InvalidBitmapProof(BitmapFault::Ungraftable),
-    VerifyError::InvalidBitmapProof(BitmapFault::NeedsBytes),
+    VerifyError::InvalidBitmapProof(BitmapFault::ProofShape),
+    VerifyError::InvalidBitmapProof(BitmapFault::RawRoot),
 ];
 
 /// The pre-state facts a batch needs were not established: range expansion runs first, and a
@@ -499,7 +500,14 @@ fn corrupt<F: Graftable>(
                 return None;
             };
             bitmap.units.pop()?;
-            &[VerifyError::InvalidBitmapProof(BitmapFault::Coverage)]
+            // Units are authenticated before coverage is checked, so the dropped unit can first
+            // break the tree proofs' shape, or leave a claimed record's bit unknown.
+            &[
+                VerifyError::InvalidBitmapProof(BitmapFault::Coverage),
+                VerifyError::InvalidBitmapProof(BitmapFault::ProofShape),
+                VerifyError::InvalidBitmapProof(BitmapFault::RawRoot),
+                VerifyError::InactiveClaim,
+            ]
         }
         7 => {
             proof.pre_state_claims.first()?;
@@ -644,11 +652,9 @@ fn corrupt<F: Graftable>(
                     GROWN_ZERO_SUBTREE
                 }
                 _ => {
-                    // A pair starting at the block's second chunk is misaligned. A block of four
-                    // chunks or more holds it; one of two may end its interval instead, so the
-                    // pair overruns it first.
-                    let (first, height, digest) =
-                        (*first_chunk, *chunk_height, *common_subtree_digest);
+                    // A pair starting at the block's second chunk is misaligned, which the
+                    // verifier finds before it checks coverage or the tree proofs.
+                    let (first, digest) = (*first_chunk, *common_subtree_digest);
                     bitmap.units.splice(
                         index..=index,
                         [
@@ -656,14 +662,7 @@ fn corrupt<F: Graftable>(
                             BitmapUnit::zero_subtree(first + 1, 1, digest),
                         ],
                     );
-                    if height >= 2 {
-                        &[VerifyError::InvalidBitmapProof(BitmapFault::Misaligned)]
-                    } else {
-                        &[
-                            VerifyError::InvalidBitmapProof(BitmapFault::Misaligned),
-                            VerifyError::InvalidBitmapProof(BitmapFault::Coverage),
-                        ]
-                    }
+                    &[VerifyError::InvalidBitmapProof(BitmapFault::Misaligned)]
                 }
             }
         }

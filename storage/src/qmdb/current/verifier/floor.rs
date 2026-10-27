@@ -47,7 +47,7 @@ pub(crate) type Candidate<'a, F, K, V> = (Location<F>, &'a update::Ordered<K, V>
 /// Floor replay needs both completeness (every candidate is present) and authentic
 /// contents (each candidate has the committed key, value, and successor). Bitmap
 /// coverage establishes the locations, and the bundle's shared record proof, checked by
-/// [`super::ordered::authenticate_and_merge_records`], establishes the payloads.
+/// [`super::ordered::authenticate_records`], establishes the payloads.
 /// This lets replay decide which records the batch supersedes and which it must copy.
 ///
 /// Compare locations in order with every set bit in `[old_floor, floor_scan_end)`,

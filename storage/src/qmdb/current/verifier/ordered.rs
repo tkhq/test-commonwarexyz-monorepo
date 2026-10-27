@@ -33,7 +33,7 @@ use alloc::{
     vec::Vec,
 };
 use commonware_codec::{Codec, Encode as _};
-use commonware_cryptography::{Digest, Hasher};
+use commonware_cryptography::Hasher;
 use core::ops::Bound;
 
 /// Each mutated key with the value a set writes, or `None` for a delete, after range deletes
@@ -110,25 +110,19 @@ where
 }
 
 /// Authenticate the payload of every pre-state record the bundle supplies, the key claims'
-/// records and the floor candidates, with the bundle's one shared raw multi-proof, and merge
-/// the claims into the cache.
+/// records and the floor candidates, with the bundle's one shared raw multi-proof.
 ///
 /// Inclusion alone does not make a record current: a superseded record stays in the log.
-/// The caller checks each claim's activity bit against the verified bitmap, with
-/// [`check_claim_activity`], before accepting the transition, and the candidates'
-/// completeness with [`super::floor::verify_candidates`]. A location that two claims, or a
-/// claim and a candidate, share must carry one payload. Return the claims' distinct
-/// locations, whose chunks the bitmap proof must cover.
-///
-/// Claims merge in their original order. An error may follow successful earlier merges, so
-/// the caller must discard the working cache on failure.
-pub(crate) fn authenticate_and_merge_records<F, K, V, H, const N: usize>(
+/// [`merge_active_claims`] admits the claims only once the verified bitmap shows them
+/// active, and [`super::floor::verify_candidates`] checks the candidates' completeness. A
+/// location that two claims, or a claim and a candidate, share must carry one payload.
+/// Return each claim's location and record, in the claims' order.
+pub(crate) fn authenticate_records<F, K, V, H, const N: usize>(
     pre: &AuthenticatedPreState<F, K, V, H, N>,
-    map: &mut TrustedMap<F, K, V, H, N>,
     claims: &[PreStateKeyClaim<F, K, V>],
     candidates: &[CandidateOperation<F, K, V>],
     proof: Option<&merkle::Proof<F, H::Digest>>,
-) -> Result<BTreeSet<Location<F>>, VerifyError>
+) -> Result<Vec<ClaimedRecord<F, K, V>>, VerifyError>
 where
     F: Graftable,
     K: Key,
@@ -136,19 +130,13 @@ where
     H: Hasher,
     Operation<F, update::Ordered<K, V>>: Codec,
 {
+    let claimed = claims
+        .iter()
+        .map(claim_record)
+        .collect::<Result<Vec<_>, _>>()?;
     let mut records = BTreeMap::new();
-    let mut claimed = Vec::with_capacity(claims.len());
-    for claim in claims {
-        let (location, update, exclusion) = claim_record(claim)?;
-        if location < pre.old_floor || location >= pre.terminal_location {
-            return Err(if exclusion {
-                VerifyError::InvalidExclusionProof
-            } else {
-                VerifyError::InvalidMemberProof
-            });
-        }
-        insert_record(&mut records, location, Operation::Update(update.clone()))?;
-        claimed.push((location, update, exclusion));
+    for (location, update, _) in &claimed {
+        insert_record(&mut records, *location, Operation::Update(update.clone()))?;
     }
     for (location, operation) in candidates {
         insert_record(&mut records, *location, operation.clone())?;
@@ -160,20 +148,11 @@ where
             && raw.inactive_peaks == F::inactive_peaks(pre.commitment.size(), pre.old_floor)
             && qmdb::verify_multi_proof::<H, F, _>(raw, &operations, &pre.ops_root)
     });
-    if !authentic {
-        return Err(VerifyError::InvalidRecordProof);
+    if authentic {
+        Ok(claimed)
+    } else {
+        Err(VerifyError::InvalidRecordProof)
     }
-    let mut locations = BTreeSet::new();
-    for (location, update, exclusion) in claimed {
-        locations.insert(location);
-        let edge = exclusion.then(|| (update.key.clone(), update.next_key.clone()));
-        merge_member(map, location, update)?;
-        if let Some((key, next_key)) = edge {
-            map.install_span(key, next_key)
-                .map_err(|_| VerifyError::ConflictingPreState)?;
-        }
-    }
-    Ok(locations)
 }
 
 /// Add one supplied record to the set the shared proof covers; a location supplied twice
@@ -199,21 +178,46 @@ where
     }
 }
 
-/// Require every claimed record to be active in the pre-state, as the verified bitmap shows.
-/// The bitmap proof covers each claim's chunk, so an uncovered bit is a defect of the proof.
-pub(crate) fn check_claim_activity<F, D, const N: usize>(
-    bitmap: &VerifiedBitmapView<F, D, N>,
-    claimed: &BTreeSet<Location<F>>,
-) -> Result<(), VerifyError>
+/// Merge authenticated claims into the cache once the verified bitmap shows every claimed
+/// record active.
+///
+/// An active record is its key's current record, so a member claim's key is present with that
+/// value and successor, and an exclusion's owner span contains no active key. A valid pre-state
+/// has no active record below its floor, and its terminal is a commit, so every merged location
+/// lies in the pre-state's live operations. A bit the bitmap proof does not cover counts as
+/// inactive; [`super::bitmap::check_bitmap_coverage`] later requires each claimed chunk.
+/// Return the claims' distinct locations, whose chunks the bitmap proof must cover.
+///
+/// Claims merge in their original order. An error may follow successful earlier merges, so
+/// the caller must discard the working cache on failure.
+pub(crate) fn merge_active_claims<F, K, V, H, const N: usize>(
+    map: &mut TrustedMap<F, K, V, H, N>,
+    bitmap: &VerifiedBitmapView<F, H::Digest, N>,
+    claimed: Vec<ClaimedRecord<F, K, V>>,
+) -> Result<BTreeSet<Location<F>>, VerifyError>
 where
     F: Graftable,
-    D: Digest,
+    K: Key,
+    V: ValueEncoding,
+    H: Hasher,
 {
-    if claimed.iter().all(|location| bitmap.bit(*location) == Some(true)) {
-        Ok(())
-    } else {
-        Err(VerifyError::InactiveClaim)
+    if !claimed
+        .iter()
+        .all(|(location, _, _)| bitmap.bit(*location) == Some(true))
+    {
+        return Err(VerifyError::InactiveClaim);
     }
+    let mut locations = BTreeSet::new();
+    for (location, update, exclusion) in claimed {
+        locations.insert(location);
+        let edge = exclusion.then(|| (update.key.clone(), update.next_key.clone()));
+        merge_member(map, location, update)?;
+        if let Some((key, next_key)) = edge {
+            map.install_span(key, next_key)
+                .map_err(|_| VerifyError::ConflictingPreState)?;
+        }
+    }
+    Ok(locations)
 }
 
 /// Cached fields needed to invalidate a record and derive its replacement or deletion.
