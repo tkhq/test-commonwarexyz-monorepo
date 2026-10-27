@@ -173,7 +173,58 @@ where
     Operation<F, update::Ordered<K, V>>: Codec,
 {
     let verified = strategy.try_map_collect_vec(claims, |claim| authenticate_claim(pre, claim))?;
-    for claim in verified {
+    merge_claims(map, verified)
+}
+
+/// Merge claims a prover read from its own committed database, without authenticating them.
+///
+/// The prover derives the transition it proves from the same cache a recipient builds, so the
+/// merge and its conflict checks are those of [`verify_and_merge_claims`]. Only the Merkle
+/// checks are skipped: the recipient performs them.
+#[cfg(all(feature = "std", not(feature = "prover-self-check")))]
+pub(crate) fn merge_trusted_claims<F, K, V, H, const N: usize>(
+    map: &mut TrustedMap<F, K, V, H, N>,
+    claims: &[PreStateKeyClaim<F, K, V, H::Digest, N>],
+) -> Result<(), VerifyError>
+where
+    F: Graftable,
+    K: Key,
+    V: ValueEncoding,
+    H: Hasher,
+{
+    merge_claims(
+        map,
+        claims.iter().map(|claim| match claim {
+            PreStateKeyClaim::Member(claim) => Some((
+                claim.proof.proof.loc,
+                update::Ordered {
+                    key: claim.key.clone(),
+                    value: claim.value.clone(),
+                    next_key: claim.proof.next_key.clone(),
+                },
+                false,
+            )),
+            PreStateKeyClaim::Exclusion(claim) => match &claim.proof {
+                ExclusionProof::KeyValue(proof, update) => Some((proof.loc, update.clone(), true)),
+                ExclusionProof::Commit(..) => None,
+            },
+        }),
+    )
+}
+
+/// Merge authenticated claims in their original order. An error may follow successful earlier
+/// merges, so the caller must discard the working cache on failure.
+fn merge_claims<F, K, V, H, const N: usize>(
+    map: &mut TrustedMap<F, K, V, H, N>,
+    claims: impl IntoIterator<Item = AuthenticatedClaim<F, K, V>>,
+) -> Result<(), VerifyError>
+where
+    F: Graftable,
+    K: Key,
+    V: ValueEncoding,
+    H: Hasher,
+{
+    for claim in claims {
         if let Some((location, update, exclusion)) = claim {
             let edge = exclusion.then(|| (update.key.clone(), update.next_key.clone()));
             merge_member(map, location, update)?;
