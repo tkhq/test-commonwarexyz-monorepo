@@ -480,25 +480,30 @@ where
     S: Strategy,
     Operation<F, OrderedUpdate<K, V>>: Codec,
 {
-    try_join_all(
-        diff.iter()
-            .filter_map(|(key, entry)| Some((key, entry.base_old_loc()?)))
-            .map(|(key, location)| async move {
-        match db
-            .any
-            .log
-            .read(*location)
-            .await
-            .map_err(qmdb::Error::Journal)?
-        {
-            Operation::Update(update) if update.key == *key => Ok((location, update)),
-            _ => Err(BuildError::InvalidState(
-                "a batch's base location does not hold its key's update",
-            )),
-        }
-    }),
-    )
-    .await
+    // The reads are built in a loop, not by closures over references, so that the future stays
+    // `Send` for callers that spawn it: a closure taking a reference has a higher-ranked type the
+    // compiler cannot prove `Send` across the `await`.
+    let mut reads = Vec::new();
+    for (key, entry) in diff {
+        let Some(location) = entry.base_old_loc() else {
+            continue;
+        };
+        reads.push(async move {
+            match db
+                .any
+                .log
+                .read(*location)
+                .await
+                .map_err(qmdb::Error::Journal)?
+            {
+                Operation::Update(update) if update.key == *key => Ok((location, update)),
+                _ => Err(BuildError::InvalidState(
+                    "a batch's base location does not hold its key's update",
+                )),
+            }
+        });
+    }
+    try_join_all(reads).await
 }
 
 /// Recover from a merkleized batch the transition a verifier derives for it.
