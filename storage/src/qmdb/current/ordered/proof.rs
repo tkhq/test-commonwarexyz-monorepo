@@ -99,14 +99,35 @@ where
     }
 }
 
-/// Authenticate complete coverage of one finite original-key interval using existing claims.
+/// One key's membership or absence, each with its own proof, as [`verify_range`] consumes it.
+#[derive(Clone)]
+pub enum RangeClaim<F: Graftable, K: Key, V: ValueEncoding, D: Digest, const N: usize> {
+    /// `key` holds `value`; the proof carries the record's location and successor.
+    Member {
+        /// The member key.
+        key: K,
+        /// The member's value.
+        value: V::Value,
+        /// The member's proof.
+        proof: constant::KeyValueProof<F, K, D, N>,
+    },
+    /// `queried_key` is absent.
+    Exclusion {
+        /// The absent key.
+        queried_key: K,
+        /// The proof of its absence.
+        proof: constant::ExclusionProof<F, K, V, D, N>,
+    },
+}
+
+/// Authenticate complete coverage of one finite original-key interval using key claims.
 ///
 /// The first claim describes the lower endpoint. Remaining claims must contain every successive
 /// member in order. All claims bind to the supplied complete trusted commitment. On success,
 /// member claims whose keys lie within `bounds` are exactly the range result.
 pub fn verify_range<F, K, V, H, const N: usize>(
     bounds: (core::ops::Bound<&K>, core::ops::Bound<&K>),
-    claims: &[crate::qmdb::current::verifier::PreStateKeyClaim<F, K, V, H::Digest, N>],
+    claims: &[RangeClaim<F, K, V, H::Digest, N>],
     commitment: &crate::qmdb::current::verifier::CurrentCommitment<F, K, V, H, N>,
 ) -> bool
 where
@@ -116,7 +137,7 @@ where
     H: Hasher,
     Operation<F, K, V>: Codec,
 {
-    use crate::qmdb::{any::ordered::range::RangeWalk, current::verifier::PreStateKeyClaim};
+    use crate::qmdb::any::ordered::range::RangeWalk;
     use core::ops::Bound;
 
     let (Bound::Included(start) | Bound::Excluded(start)) = bounds.0 else {
@@ -126,24 +147,23 @@ where
         return false;
     };
     let (exact, successor) = match anchor {
-        PreStateKeyClaim::Member(member) => {
-            if member.key != *start
-                || member.proof.proof.range_proof.proof.leaves != commitment.size()
-                || !member.proof.verify::<H, V>(
-                    member.key.clone(),
-                    member.value.clone(),
-                    commitment.root(),
-                )
+        RangeClaim::Member { key, value, proof } => {
+            if key != start
+                || proof.proof.range_proof.proof.leaves != commitment.size()
+                || !proof.verify::<H, V>(key.clone(), value.clone(), commitment.root())
             {
                 return false;
             }
-            (true, Some(&member.proof.next_key))
+            (true, Some(&proof.next_key))
         }
-        PreStateKeyClaim::Exclusion(absent) => {
-            if absent.queried_key != *start || !absent.proof.verify::<H>(start, commitment.root()) {
+        RangeClaim::Exclusion {
+            queried_key,
+            proof: absence,
+        } => {
+            if queried_key != start || !absence.verify::<H>(start, commitment.root()) {
                 return false;
             }
-            let (proof, successor) = match &absent.proof {
+            let (proof, successor) = match absence {
                 ExclusionProof::KeyValue(proof, update) => (proof, Some(&update.next_key)),
                 ExclusionProof::Commit(proof, _) => {
                     if proof.loc != commitment.size() - 1 {
@@ -170,16 +190,12 @@ where
         }
     }
     for claim in remainder {
-        let PreStateKeyClaim::Member(member) = claim else {
+        let RangeClaim::Member { key, value, proof } = claim else {
             return false;
         };
-        if !walk.advance(&member.key, &member.proof.next_key)
-            || member.proof.proof.range_proof.proof.leaves != commitment.size()
-            || !member.proof.verify::<H, V>(
-                member.key.clone(),
-                member.value.clone(),
-                commitment.root(),
-            )
+        if !walk.advance(key, &proof.next_key)
+            || proof.proof.range_proof.proof.leaves != commitment.size()
+            || !proof.verify::<H, V>(key.clone(), value.clone(), commitment.root())
         {
             return false;
         }

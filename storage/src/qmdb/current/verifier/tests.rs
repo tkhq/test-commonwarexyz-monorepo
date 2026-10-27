@@ -2,7 +2,7 @@
 
 use super::{
     BatchProofBundle, BitmapFault, BitmapProof, BitmapUnit, BuildError, BundleConfig,
-    CandidateFault, CurrentCommitment, InsufficientPreState, PreStateKeyClaim, PreStateMemberClaim,
+    CandidateFault, CurrentCommitment, InsufficientPreState, PreStateKeyClaim,
     PreStateOpeningClaim, TrustedMap, UserBatch, UserOp, VerifyError,
     subtree::{SubtreeTarget, create_multi_subtree_proof},
 };
@@ -285,7 +285,10 @@ fn reject_forgeries<F: Graftable, P: Policy<F, Key, Key> + Clone + Debug>(
         };
         rejects(
             "no key claims",
-            &[VerifyError::InsufficientPreState(missing)],
+            &[
+                VerifyError::InsufficientPreState(missing),
+                VerifyError::InvalidRecordProof,
+            ],
             batch,
             pre,
             &forged,
@@ -294,20 +297,18 @@ fn reject_forgeries<F: Graftable, P: Policy<F, Key, Key> + Clone + Debug>(
         );
     }
     if !database_empty && open_below {
-        use crate::qmdb::current::ordered::proof::constant::ExclusionProof;
-
         // Drop every claim carrying the greatest key's record, which wraps to the least.
         let mut forged = proof.clone();
         forged.pre_state_claims.retain(|claim| match claim {
-            PreStateKeyClaim::Member(member) => member.proof.next_key > member.key,
-            PreStateKeyClaim::Exclusion(exclusion) => !matches!(&exclusion.proof,
-                ExclusionProof::KeyValue(_, update) if update.next_key <= update.key),
+            PreStateKeyClaim::Member(member) => member.next_key > member.key,
+            PreStateKeyClaim::Exclusion(exclusion) => exclusion.owner.next_key > exclusion.owner.key,
         });
         rejects(
             "a missing wrapping record",
-            &[VerifyError::InsufficientPreState(
-                InsufficientPreState::OrderedEdge,
-            )],
+            &[
+                VerifyError::InsufficientPreState(InsufficientPreState::OrderedEdge),
+                VerifyError::InvalidRecordProof,
+            ],
             batch,
             pre,
             &forged,
@@ -320,7 +321,10 @@ fn reject_forgeries<F: Graftable, P: Policy<F, Key, Key> + Clone + Debug>(
         forged.pre_state_candidates.operations.remove(0);
         rejects(
             "a missing candidate",
-            &[Candidates(CandidateFault::Locations)],
+            &[
+                Candidates(CandidateFault::Locations),
+                VerifyError::InvalidRecordProof,
+            ],
             batch,
             pre,
             &forged,
@@ -333,7 +337,10 @@ fn reject_forgeries<F: Graftable, P: Policy<F, Key, Key> + Clone + Debug>(
         }
         rejects(
             "a changed candidate value",
-            &[Candidates(CandidateFault::Proof)],
+            &[
+                VerifyError::InvalidRecordProof,
+                VerifyError::ConflictingPreState,
+            ],
             batch,
             pre,
             &forged,
@@ -352,7 +359,10 @@ fn reject_forgeries<F: Graftable, P: Policy<F, Key, Key> + Clone + Debug>(
         }
         rejects(
             "a changed member value",
-            &[VerifyError::InvalidMemberProof],
+            &[
+                VerifyError::InvalidRecordProof,
+                VerifyError::ConflictingPreState,
+            ],
             batch,
             pre,
             &forged,
@@ -361,11 +371,14 @@ fn reject_forgeries<F: Graftable, P: Policy<F, Key, Key> + Clone + Debug>(
         );
         let mut forged = proof.clone();
         if let PreStateKeyClaim::Member(member) = &mut forged.pre_state_claims[index] {
-            member.proof.next_key = flipped(&member.proof.next_key);
+            member.next_key = flipped(&member.next_key);
         }
         rejects(
             "a changed member successor",
-            &[VerifyError::InvalidMemberProof],
+            &[
+                VerifyError::InvalidRecordProof,
+                VerifyError::ConflictingPreState,
+            ],
             batch,
             pre,
             &forged,
@@ -652,8 +665,6 @@ async fn without_zero_subtrees<F: Graftable, S: Strategy>(
 
 /// The most digests any one Merkle proof, pinned-node list, or append frontier in `proof` holds.
 fn max_digests<F: Graftable>(proof: &Bundle<F>) -> usize {
-    use crate::qmdb::current::ordered::proof::constant::ExclusionProof;
-
     let mut most = 0;
     if let PreStateOpeningClaim::Proven { terminal, .. } = &proof.pre_state {
         most = terminal
@@ -662,22 +673,13 @@ fn max_digests<F: Graftable>(proof: &Bundle<F>) -> usize {
             .len()
             .max(terminal.pins_before_terminal.len());
     }
-    for claim in &proof.pre_state_claims {
-        let operation_proof = match claim {
-            PreStateKeyClaim::Member(member) => &member.proof.proof,
-            PreStateKeyClaim::Exclusion(exclusion) => match &exclusion.proof {
-                ExclusionProof::KeyValue(proof, _) | ExclusionProof::Commit(proof, _) => proof,
-            },
-        };
-        most = most.max(operation_proof.range_proof.proof.digests.len());
-    }
     if let BitmapProof::Proven(bitmap) = &proof.bitmap {
         for merkle_proof in bitmap.raw_proof.iter().chain(&bitmap.grafted_proof) {
             most = most.max(merkle_proof.digests.len());
         }
         most = most.max(bitmap.grafted_append_frontier.len());
     }
-    if let Some(raw) = &proof.pre_state_candidates.raw_multi_proof {
+    if let Some(raw) = &proof.records_proof {
         most = most.max(raw.digests.len());
     }
     most
@@ -828,7 +830,7 @@ where
             if let PreStateKeyClaim::Member(member) = claim {
                 use super::OptionTrusted::KnownTrusted;
                 let entry = fresh.parent().entry(&member.key).unwrap();
-                assert_eq!(entry.location, KnownTrusted(member.proof.proof.loc));
+                assert_eq!(entry.location, KnownTrusted(member.location));
                 assert_eq!(entry.value, KnownTrusted(member.value.clone()));
             }
         }
@@ -1221,7 +1223,7 @@ fn prover_refuses_unsupported_policies() {
 
 /// A finite interval is proven by its lower endpoint's classification and every member after it.
 async fn range_claims<F: Graftable>(context: deterministic::Context) {
-    use crate::qmdb::current::ordered::proof::verify_range;
+    use crate::qmdb::current::ordered::proof::{RangeClaim, verify_range};
 
     let page_cache = CacheRef::new(NZU16!(4096), NZUsize!(16));
     let config = FixedConfig {
@@ -1258,18 +1260,14 @@ async fn range_claims<F: Graftable>(context: deterministic::Context) {
     db = db.apply_batch(merkleized).await.unwrap();
     let commitment = Commitment::<F>::from_parts(db.bounds().end, db.root()).unwrap();
 
-    let member = async |at: u64| {
-        PreStateKeyClaim::Member(PreStateMemberClaim {
-            key: key(at),
-            value: key(at / 10),
-            proof: db.key_value_proof(key(at)).await.unwrap(),
-        })
+    let member = async |at: u64| RangeClaim::Member {
+        key: key(at),
+        value: key(at / 10),
+        proof: db.key_value_proof(key(at)).await.unwrap(),
     };
-    let absent = async |at: u64| {
-        PreStateKeyClaim::Exclusion(super::PreStateExclusionClaim {
-            queried_key: key(at),
-            proof: db.exclusion_proof(&key(at)).await.unwrap(),
-        })
+    let absent = async |at: u64| RangeClaim::Exclusion {
+        queried_key: key(at),
+        proof: db.exclusion_proof(&key(at)).await.unwrap(),
     };
     let (k20, k40) = (key(20), key(40));
     let included = (Bound::Included(&k20), Bound::Included(&k40));
