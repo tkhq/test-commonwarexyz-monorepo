@@ -600,11 +600,11 @@ hash = "2b4c3fd8299f646e7570bd8cfeedc9335f6355cd2eb4c57230aecac5c0adc992"
 
 ["commonware_storage::qmdb::current::verifier::codec::tests::conformance::CodecConformance<MmbBundle>"]
 n_cases = 256
-hash = "f049faf690447b641fa3de2898b806e51a892664876113272f8b54bf4283c621"
+hash = "68c21e04ff5d5175d69640df973dff8661849e53c4e44fdb7184e797ec7384c7"
 
 ["commonware_storage::qmdb::current::verifier::codec::tests::conformance::CodecConformance<MmrBundle>"]
 n_cases = 256
-hash = "722fae4f1620d905b1a8828e68bcd1b396c6422a727f81bfb3bfeb6c91a22fa9"
+hash = "443a72867d289c37448899afb3df38174d531dacd82fc4aba702120a7f435709"
 
 ["commonware_storage::qmdb::immutable::operation::fixed::tests::conformance::CodecConformance<FixedOp>"]
 n_cases = 65536

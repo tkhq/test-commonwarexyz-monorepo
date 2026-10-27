@@ -13,7 +13,6 @@ use super::{
 use crate::{
     merkle::{Family, Graftable, Location},
     qmdb::{
-        self,
         any::{
             ValueEncoding,
             operation::{Operation, update},
@@ -47,25 +46,19 @@ pub(crate) type Candidate<'a, F, K, V> = (Location<F>, &'a update::Ordered<K, V>
 ///
 /// Floor replay needs both completeness (every candidate is present) and authentic
 /// contents (each candidate has the committed key, value, and successor). Bitmap
-/// coverage establishes the locations, and raw inclusion establishes the payloads.
+/// coverage establishes the locations, and the bundle's shared record proof, checked by
+/// [`super::ordered::authenticate_and_merge_records`], establishes the payloads.
 /// This lets replay decide which records the batch supersedes and which it must copy.
 ///
 /// Compare locations in order with every set bit in `[old_floor, floor_scan_end)`,
 /// excluding the separately authenticated terminal. Reject missing, extra, duplicate,
-/// or reordered candidates and non-update payloads. A raw multi-proof bound to the
-/// same size, floor, and operations root authenticates their contents. Bitmap coverage
-/// must already have been verified: this function relies on it to prove completeness.
-/// For `f > 0` candidates in a log of `n` operations, let `h` be one plus the tree
-/// height and `q = f * (1 + log(n / f)) + h`. Shared witness planning and hashing
-/// visit O(q) nodes. Including sorting and binary searches, worst-case CPU is
-/// O(e_scan * N + (f + q) * log(f + w + 2)), where `w` is the witness count and
-/// `e_scan` counts explicit scan chunks. Temporary memory is O(f + w + h), plus
-/// encoded payload bytes. For no candidates, only the bitmap scan remains.
-/// These bounds also cover average-case work without assuming a location distribution.
+/// or reordered candidates and non-update payloads. Bitmap coverage must already have
+/// been verified: this function relies on it to prove completeness. CPU is
+/// O(e_scan * N + f) for `f` candidates and `e_scan` explicit scan chunks, and memory O(f).
 pub(crate) fn verify_candidates<'a, F, K, V, H, const N: usize>(
     pre: &AuthenticatedPreState<F, K, V, H, N>,
     bitmap: &VerifiedBitmapView<F, H::Digest, N>,
-    proof: &'a PreStateCandidateProof<F, K, V, H::Digest>,
+    proof: &'a PreStateCandidateProof<F, K, V>,
 ) -> Result<Vec<Candidate<'a, F, K, V>>, VerifyError>
 where
     F: Graftable,
@@ -85,27 +78,14 @@ where
     {
         return Err(CandidateFault::Locations.into());
     }
-    let candidates = proof
+    Ok(proof
         .operations
         .iter()
         .map(|(location, operation)| match operation {
             Operation::Update(update) => Ok((*location, update)),
             _ => Err(CandidateFault::NotUpdate),
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    let valid = proof
-        .raw_multi_proof
-        .as_ref()
-        .map_or(proof.operations.is_empty(), |raw| {
-            !proof.operations.is_empty()
-                && raw.leaves == pre.commitment.size()
-                && raw.inactive_peaks == F::inactive_peaks(pre.commitment.size(), pre.old_floor)
-                && qmdb::verify_multi_proof::<H, F, _>(raw, &proof.operations, &pre.ops_root)
-        });
-    if !valid {
-        return Err(CandidateFault::Proof.into());
-    }
-    Ok(candidates)
+        .collect::<Result<Vec<_>, _>>()?)
 }
 
 /// Reject a floor policy whose walk replay cannot check from the scan alone.

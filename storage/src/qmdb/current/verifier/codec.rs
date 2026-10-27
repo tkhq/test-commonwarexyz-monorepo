@@ -16,7 +16,7 @@ use crate::{
             ValueEncoding,
             operation::{Operation, update},
         },
-        current::{ordered::proof::constant, proof::OpsRootWitness},
+        current::proof::OpsRootWitness,
         operation::Key,
     },
 };
@@ -213,102 +213,88 @@ impl<F: Graftable, V: ValueEncoding, D: Digest, const N: usize> Read
     }
 }
 
-impl<F: Graftable, K: Key, V: Write, D: Digest, const N: usize> Write
-    for PreStateMemberClaim<F, K, V, D, N>
-{
+impl<F: Family, K: Key, V: Write> Write for PreStateMemberClaim<F, K, V> {
     fn write(&self, buf: &mut impl BufMut) {
+        self.location.write(buf);
         self.key.write(buf);
         self.value.write(buf);
-        self.proof.write(buf);
+        self.next_key.write(buf);
     }
 }
 
-impl<F: Graftable, K: Key, V: EncodeSize, D: Digest, const N: usize> EncodeSize
-    for PreStateMemberClaim<F, K, V, D, N>
-{
+impl<F: Family, K: Key, V: EncodeSize> EncodeSize for PreStateMemberClaim<F, K, V> {
     fn encode_size(&self) -> usize {
-        self.key.encode_size() + self.value.encode_size() + self.proof.encode_size()
+        self.location.encode_size()
+            + self.key.encode_size()
+            + self.value.encode_size()
+            + self.next_key.encode_size()
     }
 }
 
-impl<F: Graftable, K: Key, V: Read, D: Digest, const N: usize> Read
-    for PreStateMemberClaim<F, K, V, D, N>
-{
-    /// `(max_digests, key_cfg, value_cfg)`.
-    type Cfg = (usize, K::Cfg, V::Cfg);
+impl<F: Family, K: Key, V: Read> Read for PreStateMemberClaim<F, K, V> {
+    /// `(key_cfg, value_cfg)`.
+    type Cfg = (K::Cfg, V::Cfg);
 
-    fn read_cfg(buf: &mut impl Buf, (max_digests, key, value): &Self::Cfg) -> Result<Self, Error> {
+    fn read_cfg(buf: &mut impl Buf, (key, value): &Self::Cfg) -> Result<Self, Error> {
         Ok(Self {
+            location: Location::read(buf)?,
             key: K::read_cfg(buf, key)?,
             value: V::read_cfg(buf, value)?,
-            proof: constant::KeyValueProof::read_cfg(buf, &(*max_digests, key.clone()))?,
+            next_key: K::read_cfg(buf, key)?,
         })
     }
 }
 
-impl<F, K, V, D, const N: usize> Write for PreStateExclusionClaim<F, K, V, D, N>
+impl<F, K, V> Write for PreStateExclusionClaim<F, K, V>
 where
-    F: Graftable,
+    F: Family,
     K: Key,
     V: ValueEncoding,
-    D: Digest,
     update::Ordered<K, V>: Write,
 {
     fn write(&self, buf: &mut impl BufMut) {
         self.queried_key.write(buf);
-        self.proof.write(buf);
+        self.location.write(buf);
+        self.owner.write(buf);
     }
 }
 
-impl<F, K, V, D, const N: usize> EncodeSize for PreStateExclusionClaim<F, K, V, D, N>
+impl<F, K, V> EncodeSize for PreStateExclusionClaim<F, K, V>
 where
-    F: Graftable,
+    F: Family,
     K: Key,
     V: ValueEncoding,
-    D: Digest,
     update::Ordered<K, V>: EncodeSize,
 {
     fn encode_size(&self) -> usize {
-        self.queried_key.encode_size() + self.proof.encode_size()
+        self.queried_key.encode_size() + self.location.encode_size() + self.owner.encode_size()
     }
 }
 
-impl<F, K, V, D, const N: usize> Read for PreStateExclusionClaim<F, K, V, D, N>
+impl<F, K, V> Read for PreStateExclusionClaim<F, K, V>
 where
-    F: Graftable,
+    F: Family,
     K: Key,
     V: ValueEncoding,
-    D: Digest,
     update::Ordered<K, V>: Read,
 {
-    /// `(max_digests, key_cfg, update_cfg, value_cfg)`.
-    type Cfg = (
-        usize,
-        K::Cfg,
-        <update::Ordered<K, V> as Read>::Cfg,
-        <V::Value as Read>::Cfg,
-    );
+    /// `(key_cfg, update_cfg)`.
+    type Cfg = (K::Cfg, <update::Ordered<K, V> as Read>::Cfg);
 
-    fn read_cfg(
-        buf: &mut impl Buf,
-        (max_digests, key, update, value): &Self::Cfg,
-    ) -> Result<Self, Error> {
+    fn read_cfg(buf: &mut impl Buf, (key, update): &Self::Cfg) -> Result<Self, Error> {
         Ok(Self {
             queried_key: K::read_cfg(buf, key)?,
-            proof: constant::ExclusionProof::read_cfg(
-                buf,
-                &(*max_digests, update.clone(), value.clone()),
-            )?,
+            location: Location::read(buf)?,
+            owner: update::Ordered::read_cfg(buf, update)?,
         })
     }
 }
 
-impl<F, K, V, D, const N: usize> Write for PreStateKeyClaim<F, K, V, D, N>
+impl<F, K, V> Write for PreStateKeyClaim<F, K, V>
 where
-    F: Graftable,
+    F: Family,
     K: Key,
     V: ValueEncoding,
-    D: Digest,
     update::Ordered<K, V>: Write,
 {
     fn write(&self, buf: &mut impl BufMut) {
@@ -325,12 +311,11 @@ where
     }
 }
 
-impl<F, K, V, D, const N: usize> EncodeSize for PreStateKeyClaim<F, K, V, D, N>
+impl<F, K, V> EncodeSize for PreStateKeyClaim<F, K, V>
 where
-    F: Graftable,
+    F: Family,
     K: Key,
     V: ValueEncoding,
-    D: Digest,
     update::Ordered<K, V>: EncodeSize,
 {
     fn encode_size(&self) -> usize {
@@ -341,85 +326,76 @@ where
     }
 }
 
-impl<F, K, V, D, const N: usize> Read for PreStateKeyClaim<F, K, V, D, N>
+impl<F, K, V> Read for PreStateKeyClaim<F, K, V>
 where
-    F: Graftable,
+    F: Family,
     K: Key,
     V: ValueEncoding,
-    D: Digest,
     update::Ordered<K, V>: Read,
 {
-    /// `(max_digests, key_cfg, update_cfg, value_cfg)`, as for [`PreStateExclusionClaim`].
+    /// `(key_cfg, update_cfg, value_cfg)`.
     type Cfg = (
-        usize,
         K::Cfg,
         <update::Ordered<K, V> as Read>::Cfg,
         <V::Value as Read>::Cfg,
     );
 
-    fn read_cfg(buf: &mut impl Buf, cfg: &Self::Cfg) -> Result<Self, Error> {
-        let (max_digests, key, _, value) = cfg;
+    fn read_cfg(buf: &mut impl Buf, (key, update, value): &Self::Cfg) -> Result<Self, Error> {
         match u8::read(buf)? {
             MEMBER => Ok(Self::Member(PreStateMemberClaim::read_cfg(
                 buf,
-                &(*max_digests, key.clone(), value.clone()),
+                &(key.clone(), value.clone()),
             )?)),
-            EXCLUSION => Ok(Self::Exclusion(PreStateExclusionClaim::read_cfg(buf, cfg)?)),
+            EXCLUSION => Ok(Self::Exclusion(PreStateExclusionClaim::read_cfg(
+                buf,
+                &(key.clone(), update.clone()),
+            )?)),
             tag => Err(Error::InvalidEnum(tag)),
         }
     }
 }
 
-impl<F, K, V, D> Write for PreStateCandidateProof<F, K, V, D>
+impl<F, K, V> Write for PreStateCandidateProof<F, K, V>
 where
     F: Family,
     K: Key,
     V: ValueEncoding,
-    D: Digest,
     Operation<F, update::Ordered<K, V>>: Write,
 {
     fn write(&self, buf: &mut impl BufMut) {
         self.operations.write(buf);
-        self.raw_multi_proof.write(buf);
     }
 }
 
-impl<F, K, V, D> EncodeSize for PreStateCandidateProof<F, K, V, D>
+impl<F, K, V> EncodeSize for PreStateCandidateProof<F, K, V>
 where
     F: Family,
     K: Key,
     V: ValueEncoding,
-    D: Digest,
     Operation<F, update::Ordered<K, V>>: EncodeSize,
 {
     fn encode_size(&self) -> usize {
-        self.operations.encode_size() + self.raw_multi_proof.encode_size()
+        self.operations.encode_size()
     }
 }
 
-impl<F, K, V, D> Read for PreStateCandidateProof<F, K, V, D>
+impl<F, K, V> Read for PreStateCandidateProof<F, K, V>
 where
     F: Family,
     K: Key,
     V: ValueEncoding,
-    D: Digest,
     Operation<F, update::Ordered<K, V>>: Read,
 {
-    /// `(max_candidates, max_digests, operation_cfg)`.
-    type Cfg = (
-        usize,
-        usize,
-        <Operation<F, update::Ordered<K, V>> as Read>::Cfg,
-    );
+    /// `(max_candidates, operation_cfg)`.
+    type Cfg = (usize, <Operation<F, update::Ordered<K, V>> as Read>::Cfg);
 
     fn read_cfg(
         buf: &mut impl Buf,
-        (max_candidates, max_digests, operation): &Self::Cfg,
+        (max_candidates, operation): &Self::Cfg,
     ) -> Result<Self, Error> {
         let range: RangeCfg<usize> = (..=*max_candidates).into();
         Ok(Self {
             operations: Vec::read_cfg(buf, &(range, ((), operation.clone())))?,
-            raw_multi_proof: Option::<merkle::Proof<F, D>>::read_cfg(buf, max_digests)?,
         })
     }
 }
@@ -591,6 +567,7 @@ where
         self.pre_state_claims.write(buf);
         self.bitmap.write(buf);
         self.pre_state_candidates.write(buf);
+        self.records_proof.write(buf);
     }
 }
 
@@ -609,6 +586,7 @@ where
             + self.pre_state_claims.encode_size()
             + self.bitmap.encode_size()
             + self.pre_state_candidates.encode_size()
+            + self.records_proof.encode_size()
     }
 }
 
@@ -624,12 +602,7 @@ where
     type Cfg = BundleConfigFor<F, K, V>;
 
     fn read_cfg(buf: &mut impl Buf, cfg: &Self::Cfg) -> Result<Self, Error> {
-        let claim_cfg = (
-            cfg.max_digests,
-            cfg.key.clone(),
-            cfg.update.clone(),
-            cfg.value.clone(),
-        );
+        let claim_cfg = (cfg.key.clone(), cfg.update.clone(), cfg.value.clone());
         Ok(Self {
             claims: ClaimedBatchBounds::read(buf)?,
             pre_state: PreStateOpeningClaim::read_cfg(buf, &(cfg.max_digests, cfg.value.clone()))?,
@@ -637,8 +610,9 @@ where
             bitmap: BitmapProof::read_cfg(buf, &(cfg.max_bitmap_units, cfg.max_digests))?,
             pre_state_candidates: PreStateCandidateProof::read_cfg(
                 buf,
-                &(cfg.max_candidates, cfg.max_digests, cfg.operation.clone()),
+                &(cfg.max_candidates, cfg.operation.clone()),
             )?,
+            records_proof: Option::<merkle::Proof<F, H::Digest>>::read_cfg(buf, &cfg.max_digests)?,
         })
     }
 }
@@ -704,41 +678,39 @@ mod arbitrary_impls {
         }
     }
 
-    impl<F: Graftable, K: Key, V, D: Digest, const N: usize> Arbitrary<'_>
-        for PreStateMemberClaim<F, K, V, D, N>
+    impl<F: Family, K: Key, V> Arbitrary<'_> for PreStateMemberClaim<F, K, V>
     where
         K: for<'a> Arbitrary<'a>,
         V: for<'a> Arbitrary<'a>,
-        constant::KeyValueProof<F, K, D, N>: for<'a> Arbitrary<'a>,
     {
         fn arbitrary(u: &mut Unstructured<'_>) -> Result<Self> {
             Ok(Self {
+                location: u.arbitrary()?,
                 key: u.arbitrary()?,
                 value: u.arbitrary()?,
-                proof: u.arbitrary()?,
+                next_key: u.arbitrary()?,
             })
         }
     }
 
-    impl<F: Graftable, K: Key, V: ValueEncoding, D: Digest, const N: usize> Arbitrary<'_>
-        for PreStateExclusionClaim<F, K, V, D, N>
+    impl<F: Family, K: Key, V: ValueEncoding> Arbitrary<'_> for PreStateExclusionClaim<F, K, V>
     where
         K: for<'a> Arbitrary<'a>,
-        constant::ExclusionProof<F, K, V, D, N>: for<'a> Arbitrary<'a>,
+        update::Ordered<K, V>: for<'a> Arbitrary<'a>,
     {
         fn arbitrary(u: &mut Unstructured<'_>) -> Result<Self> {
             Ok(Self {
                 queried_key: u.arbitrary()?,
-                proof: u.arbitrary()?,
+                location: u.arbitrary()?,
+                owner: u.arbitrary()?,
             })
         }
     }
 
-    impl<F: Graftable, K: Key, V: ValueEncoding, D: Digest, const N: usize> Arbitrary<'_>
-        for PreStateKeyClaim<F, K, V, D, N>
+    impl<F: Family, K: Key, V: ValueEncoding> Arbitrary<'_> for PreStateKeyClaim<F, K, V>
     where
-        PreStateMemberClaim<F, K, V::Value, D, N>: for<'a> Arbitrary<'a>,
-        PreStateExclusionClaim<F, K, V, D, N>: for<'a> Arbitrary<'a>,
+        PreStateMemberClaim<F, K, V::Value>: for<'a> Arbitrary<'a>,
+        PreStateExclusionClaim<F, K, V>: for<'a> Arbitrary<'a>,
     {
         fn arbitrary(u: &mut Unstructured<'_>) -> Result<Self> {
             if u.arbitrary()? {
@@ -749,16 +721,13 @@ mod arbitrary_impls {
         }
     }
 
-    impl<F: Family, K: Key, V: ValueEncoding, D: Digest> Arbitrary<'_>
-        for PreStateCandidateProof<F, K, V, D>
+    impl<F: Family, K: Key, V: ValueEncoding> Arbitrary<'_> for PreStateCandidateProof<F, K, V>
     where
         Operation<F, update::Ordered<K, V>>: for<'a> Arbitrary<'a>,
-        D: for<'a> Arbitrary<'a>,
     {
         fn arbitrary(u: &mut Unstructured<'_>) -> Result<Self> {
             Ok(Self {
                 operations: u.arbitrary()?,
-                raw_multi_proof: u.arbitrary()?,
             })
         }
     }
@@ -823,11 +792,12 @@ mod arbitrary_impls {
         H: Hasher,
         H::Digest: for<'a> Arbitrary<'a>,
         PreStateOpeningClaim<F, V, H::Digest, N>: for<'a> Arbitrary<'a>,
-        PreStateKeyClaim<F, K, V, H::Digest, N>: for<'a> Arbitrary<'a>,
-        PreStateCandidateProof<F, K, V, H::Digest>: for<'a> Arbitrary<'a>,
+        PreStateKeyClaim<F, K, V>: for<'a> Arbitrary<'a>,
+        PreStateCandidateProof<F, K, V>: for<'a> Arbitrary<'a>,
     {
         fn arbitrary(u: &mut Unstructured<'_>) -> Result<Self> {
             Ok(Self::new(
+                u.arbitrary()?,
                 u.arbitrary()?,
                 u.arbitrary()?,
                 u.arbitrary()?,

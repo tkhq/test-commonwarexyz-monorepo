@@ -118,10 +118,6 @@ pub enum CandidateFault {
     /// A candidate payload is not an update.
     #[error("payload is not an update")]
     NotUpdate,
-    /// The candidates' raw proof is missing, unexpected, bound to another size or floor, or
-    /// does not authenticate their payloads.
-    #[error("payload proof mismatch")]
-    Proof,
     /// A batch that empties the database claims a floor scan or candidates.
     #[error("scan claimed for an emptied database")]
     EmptiedScan,
@@ -145,12 +141,20 @@ pub enum VerifyError {
     /// The pre-state opening does not authenticate the trusted commitment.
     #[error("invalid pre-state opening")]
     InvalidPreStateOpening,
-    /// A membership claim fails authentication or disagrees with the pre-state opening.
+    /// A membership claim's location lies outside the pre-state's live operations.
     #[error("invalid member proof")]
     InvalidMemberProof,
-    /// An exclusion claim fails authentication or disagrees with the pre-state opening.
+    /// An exclusion claim's record does not span its key, or lies outside the pre-state's live
+    /// operations.
     #[error("invalid exclusion proof")]
     InvalidExclusionProof,
+    /// The shared record proof is missing, unexpected, bound to another size or floor, or does
+    /// not authenticate the claims' records and the candidates' payloads.
+    #[error("invalid record proof")]
+    InvalidRecordProof,
+    /// A claimed record is not active in the pre-state.
+    #[error("inactive claimed record")]
+    InactiveClaim,
     /// Pre-state claims repeat a queried key or conflict with retained facts.
     #[error("conflicting pre-state facts")]
     ConflictingPreState,
