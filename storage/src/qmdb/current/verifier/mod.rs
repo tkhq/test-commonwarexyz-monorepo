@@ -16,6 +16,16 @@
 //! checkpoint. The client independently calls [`UserBatch::verify`] before accepting that
 //! state. Proof production never changes the database.
 //!
+//! The prover works from the database's current state, the only one its key index, activity
+//! bitmap, and grafted tree hold. To prove a batch applied at an older checkpoint whose
+//! operations the database still retains, sync a scratch database to that checkpoint from the
+//! live one with `qmdb::sync::sync`. The checkpoint's commit, proved against the old size with
+//! `Db::ops_historical_proof`, gives the target's ops root and floor, and the sync starts at or
+//! below the sync boundary the database had at that checkpoint. Prove the batch from the copy,
+//! then apply it there to reach the next checkpoint. The caller supplies the original batch and
+//! the policy's state at that time: the log records the operations a batch produced, not the
+//! batch. Pruning past that sync boundary gives up the checkpoint.
+//!
 //! The commitment does not record how far a batch advanced the inactivity floor, so the
 //! verifier and the writer must use the same [`Policy`](crate::qmdb::floor::Policy). The
 //! verifier replays policies that never evict and that either hold the floor or limit only
@@ -190,6 +200,9 @@ mod codec;
 mod commitment;
 mod error;
 mod floor;
+#[cfg(test)]
+#[cfg(feature = "std")]
+mod history_tests;
 mod opening;
 mod ordered;
 mod root;
