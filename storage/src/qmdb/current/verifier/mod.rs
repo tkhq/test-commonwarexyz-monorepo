@@ -173,6 +173,9 @@
     )
 )]
 
+#[cfg(test)]
+#[cfg(feature = "std")]
+mod attack_tests;
 mod bitmap;
 #[cfg(feature = "std")]
 mod builder;
