@@ -13,8 +13,8 @@ use super::{
     floor::{FloorResult, advance_floor, verify_candidates},
     opening::authenticate_pre_state,
     ordered::{
-        PreparedOrderedBatch, derive_ordered_transition, expand_range_deletes,
-        verify_and_merge_claims,
+        PreparedOrderedBatch, authenticate_and_merge_records, check_claim_activity,
+        derive_ordered_transition, expand_range_deletes,
     },
     root::derive_child_commitment,
 };
@@ -307,10 +307,18 @@ where
     {
         return Err(VerifyError::InvalidTrustedState);
     }
-    verify_and_merge_claims(&pre, &mut cache, &proof_bundle.pre_state_claims, strategy)?;
+    let claimed = authenticate_and_merge_records(
+        &pre,
+        &mut cache,
+        &proof_bundle.pre_state_claims,
+        &proof_bundle.pre_state_candidates.operations,
+        proof_bundle.records_proof.as_ref(),
+    )?;
     let points = expand_range_deletes(&cache, batch.ops())?;
     let prepared = derive_ordered_transition(&cache, &points)?;
-    let bitmap = verify_bitmap(&pre, &prepared, &proof_bundle.bitmap, strategy)?;
+    let bitmap = verify_bitmap(&pre, &prepared, &claimed, &proof_bundle.bitmap, strategy)?;
+    // Inclusion alone admitted the claimed records; only active ones may stand.
+    check_claim_activity(&bitmap, &claimed)?;
     let candidates = verify_candidates(&pre, &bitmap, &proof_bundle.pre_state_candidates)?;
     let floor = advance_floor(
         &pre,

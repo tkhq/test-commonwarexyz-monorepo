@@ -8,17 +8,17 @@ use super::{
     bitmap::build_bitmap_proof,
     floor::check_policy,
     opening::authenticate_pre_state,
-    ordered::{derive_ordered_transition, expand_range_deletes, verify_and_merge_claims},
+    ordered::{
+        PreparedOrderedBatch, authenticate_and_merge_records, derive_ordered_transition,
+        expand_range_deletes,
+    },
 };
 use crate::{
     journal::contiguous::{Contiguous as _, fixed::Config as JournalConfig},
     merkle::{Graftable, Location, full::Config as MerkleConfig, mmb, mmr},
     qmdb::{
-        any::value::FixedEncoding,
-        current::{
-            FixedConfig,
-            ordered::{fixed::Db, proof::constant::ExclusionProof},
-        },
+        any::{operation::update, value::FixedEncoding},
+        current::{FixedConfig, ordered::fixed::Db},
         floor::Proportional,
     },
     translator::OneCap,
@@ -27,10 +27,12 @@ use commonware_cryptography::Sha256;
 use commonware_parallel::Sequential;
 use commonware_runtime::{Runner as _, buffer::paged::CacheRef, deterministic};
 use commonware_utils::{NZU16, NZU64, NZUsize, bitmap::Readable as _, sequence::FixedBytes};
+use std::collections::BTreeSet;
 
 type Key = FixedBytes<8>;
 type Commitment<F> = CurrentCommitment<F, Key, FixedEncoding<Key>, Sha256, 32>;
 type Batch = UserBatch<Key, Key>;
+type Bundle<F> = super::BatchProofBundle<F, Key, FixedEncoding<Key>, Sha256, 32>;
 type TestDb<F> = Db<F, deterministic::Context, Key, Key, Sha256, OneCap, 32, Sequential>;
 
 fn key(value: u64) -> Key {
@@ -74,15 +76,56 @@ fn commitment<F: Graftable>(db: &TestDb<F>) -> Commitment<F> {
     Commitment::<F>::from_parts(db.bounds().end, db.root()).unwrap()
 }
 
-/// Keys 1..=8 hold their own key, then key 3 is rewritten so its first record is superseded.
-/// Returns the database, the location of the superseded record and its successor key.
+/// The claims' record locations.
+fn claimed<F: Graftable>(
+    claims: &[PreStateKeyClaim<F, Key, FixedEncoding<Key>>],
+) -> BTreeSet<Location<F>> {
+    claims
+        .iter()
+        .map(|claim| match claim {
+            PreStateKeyClaim::Member(member) => member.location,
+            PreStateKeyClaim::Exclusion(exclusion) => exclusion.location,
+        })
+        .collect()
+}
+
+/// Replace a bundle's shared record proof with a genuine one over its current claims and
+/// candidates.
+async fn reprove_records<F: Graftable>(db: &TestDb<F>, bundle: &mut Bundle<F>) {
+    let mut locations = claimed(&bundle.pre_state_claims);
+    locations.extend(
+        bundle
+            .pre_state_candidates
+            .operations
+            .iter()
+            .map(|(location, _)| *location),
+    );
+    let locations = locations.into_iter().collect::<Vec<_>>();
+    bundle.records_proof = if locations.is_empty() {
+        None
+    } else {
+        Some(
+            crate::merkle::verification::multi_proof(
+                &db.any.log.merkle,
+                F::inactive_peaks(bundle.claims.pre_size, bundle.claims.pre_floor),
+                &locations,
+            )
+            .await
+            .unwrap(),
+        )
+    };
+}
+
+/// Keys 1..=8 hold their own key, then key `rewritten` is set again so its first record is
+/// superseded. Returns the database, the location of the superseded record and its successor.
 async fn with_superseded_record<F: Graftable>(
     context: deterministic::Context,
+    rewritten: u64,
 ) -> (TestDb<F>, Location<F>, Key) {
     let db = open::<F>(context).await;
     let db = apply(db, &Batch::from_iter((1..=8).map(UserBatchOp::set))).await;
-    let (old, old_loc) = db.any.get_with_loc(&key(3)).await.unwrap().unwrap();
-    let db = apply(db, &Batch::from([UserBatchOp::set_value(3, 300)])).await;
+    let (old, old_loc) = db.any.get_with_loc(&key(rewritten)).await.unwrap().unwrap();
+    let db = apply(db, &Batch::from([UserBatchOp::set_value(rewritten, 300)])).await;
     (db, old_loc, old.next_key)
 }
 
@@ -102,7 +145,7 @@ fn reject<F: Graftable>(
     what: &str,
     batch: &Batch,
     pre: Commitment<F>,
-    bundle: &super::BatchProofBundle<F, Key, FixedEncoding<Key>, Sha256, 32>,
+    bundle: &Bundle<F>,
     post: Commitment<F>,
     expected: &[VerifyError],
 ) {
@@ -122,16 +165,17 @@ fn reject<F: Graftable>(
     );
 }
 
-/// A superseded record's genuine operation proof shows a clear activity bit, and forging the
-/// bit breaks the grafted root; neither re-establishes the old value as a member or an edge.
+/// A superseded record is still in the log, so a genuine inclusion proof covers it, but its
+/// activity bit is clear; it establishes neither membership nor an edge.
 fn stale_record_is_not_a_member<F: Graftable>() {
     let executor = deterministic::Runner::default();
     executor.start(|context| async move {
-        let (db, old_loc, old_next) = with_superseded_record::<F>(context).await;
+        // Key 8's first record is the last the floor walk reaches, so it stays above the floor.
+        let (db, old_loc, old_next) = with_superseded_record::<F>(context, 8).await;
         let pre = commitment(&db);
-        let batch = Batch::from([UserBatchOp::set_value(3, 301)]);
-        let honest = batch.build_batch_proof(&db, &Proportional).await.unwrap();
-        let merkleized = batch.merkleize(&db, &mut Proportional).await.unwrap();
+        assert!(old_loc >= db.inactivity_floor_loc());
+        let batch = Batch::from([UserBatchOp::set_value(8, 301)]);
+        let (honest, merkleized) = batch.prove(&db, &mut Proportional).await.unwrap();
         let post =
             Commitment::<F>::from_parts(merkleized.bounds().tip.size, merkleized.root()).unwrap();
         batch
@@ -144,82 +188,86 @@ fn stale_record_is_not_a_member<F: Graftable>() {
             )
             .unwrap();
 
-        // The old record of key 3, proven at its real (now inactive) location.
-        let stale_proof = db.operation_proof(old_loc).await.unwrap();
-        let stale_member = PreStateKeyClaim::Member(PreStateMemberClaim {
-            key: key(3),
-            value: key(3),
-            proof: super::super::ordered::proof::constant::KeyValueProof {
-                proof: stale_proof.clone(),
-                next_key: old_next.clone(),
-            },
-        });
+        // The old record of key 8 at its real, now inactive, location, with a genuine shared
+        // proof. The transition then supersedes it, and the bitmap shows its bit clear.
         let mut forged = honest.clone();
-        forged.pre_state_claims = vec![stale_member.clone()];
+        forged.pre_state_claims = vec![PreStateKeyClaim::Member(PreStateMemberClaim {
+            location: old_loc,
+            key: key(8),
+            value: key(8),
+            next_key: old_next.clone(),
+        })];
+        reprove_records(&db, &mut forged).await;
         reject(
             "a superseded record as a member",
             &batch,
             pre,
             &forged,
             post,
-            &[VerifyError::InvalidMemberProof],
+            &[
+                VerifyError::InvalidBitmapProof(BitmapFault::Coverage),
+                VerifyError::InvalidBitmapProof(BitmapFault::NeedsBytes),
+                VerifyError::InvalidBitmapProof(BitmapFault::Inactive),
+                VerifyError::InactiveClaim,
+            ],
         );
 
-        // Setting the bit in the proof's own chunk changes the grafted leaf.
-        let mut lit = stale_proof.clone();
-        let bit = *lit.loc % 256;
-        lit.chunk[(bit / 8) as usize] |= 1 << (bit % 8);
-        let mut forged = honest.clone();
-        forged.pre_state_claims = vec![PreStateKeyClaim::Member(PreStateMemberClaim {
-            key: key(3),
-            value: key(3),
-            proof: super::super::ordered::proof::constant::KeyValueProof {
-                proof: lit.clone(),
-                next_key: old_next.clone(),
-            },
-        })];
-        reject(
-            "a superseded record with its bit set",
-            &batch,
-            pre,
-            &forged,
-            post,
-            &[VerifyError::InvalidMemberProof],
-        );
-
-        // The stale record's edge (3 -> old_next) as an exclusion for a key between them.
-        let between = key(3) < old_next;
-        assert!(between, "old successor should be above key 3");
+        // The stale record's edge (8 -> old_next) as an exclusion for a key between them, in a
+        // delete of that absent key: nothing is superseded, so only the claim's own activity
+        // check stands in the way. Cover the claim's chunk so the bitmap proof itself passes.
         let queried = {
             let mut bytes = [0u8; 8];
-            bytes.copy_from_slice(key(3).as_ref());
+            bytes.copy_from_slice(key(8).as_ref());
             bytes[7] = bytes[7].wrapping_add(1);
             FixedBytes::new(bytes)
         };
-        let creates = Batch::from([super::UserOp::set(queried.clone(), key(9))]);
-        let honest_create = creates.build_batch_proof(&db, &Proportional).await.unwrap();
-        let merkleized = creates.merkleize(&db, &mut Proportional).await.unwrap();
-        let post_create =
+        // Key 8 is the greatest, so its link wraps to the least key and spans every greater key.
+        assert!(queried > key(8) && old_next == key(1));
+        let deletes = Batch::from([super::UserOp::delete(queried.clone())]);
+        let (honest_delete, merkleized) = deletes.prove(&db, &mut Proportional).await.unwrap();
+        let post_delete =
             Commitment::<F>::from_parts(merkleized.bounds().tip.size, merkleized.root()).unwrap();
-        let mut forged = honest_create.clone();
+        let mut forged = honest_delete.clone();
         forged.pre_state_claims = vec![PreStateKeyClaim::Exclusion(PreStateExclusionClaim {
             queried_key: queried.clone(),
-            proof: ExclusionProof::KeyValue(
-                lit,
-                crate::qmdb::any::operation::update::Ordered {
-                    key: key(3),
-                    value: key(3),
-                    next_key: old_next.clone(),
-                },
-            ),
+            location: old_loc,
+            owner: update::Ordered {
+                key: key(8),
+                value: key(8),
+                next_key: old_next.clone(),
+            },
         })];
+        reprove_records(&db, &mut forged).await;
+        let BitmapProof::Proven(bitmap) = &honest_delete.bitmap else {
+            panic!("expected a proven bitmap");
+        };
+        let unchanged = PreparedOrderedBatch {
+            application_ops: Vec::new(),
+            superseded: BTreeSet::new(),
+            deleted_keys: BTreeSet::new(),
+            post_empty: false,
+        };
+        let grafted_storage = db.grafted_storage();
+        forged.bitmap = build_bitmap_proof::<F, Key, FixedEncoding<Key>, Sha256, _, _, _, 32>(
+            pre.size(),
+            honest_delete.claims.pre_floor,
+            bitmap.floor_scan_end,
+            &unchanged,
+            &claimed(&forged.pre_state_claims),
+            db.bitmap(),
+            &db.any.log.merkle,
+            &grafted_storage,
+        )
+        .await
+        .unwrap();
+        drop(grafted_storage);
         reject(
             "a superseded edge as an exclusion",
-            &creates,
+            &deletes,
             pre,
             &forged,
-            post_create,
-            &[VerifyError::InvalidExclusionProof],
+            post_delete,
+            &[VerifyError::InactiveClaim],
         );
         db.destroy().await.unwrap();
     });
@@ -240,7 +288,7 @@ fn mmb_stale_record_is_not_a_member() {
 fn a_shortened_scan_is_rejected<F: Graftable>() {
     let executor = deterministic::Runner::default();
     executor.start(|context| async move {
-        let (db, _, _) = with_superseded_record::<F>(context).await;
+        let (db, _, _) = with_superseded_record::<F>(context, 3).await;
         let pre = commitment(&db);
         let batch = Batch::from([UserBatchOp::set_value(3, 301)]);
         let honest = batch.build_batch_proof(&db, &Proportional).await.unwrap();
@@ -268,11 +316,12 @@ fn a_shortened_scan_is_rejected<F: Graftable>() {
         // Rebuild the pre-state exactly as the prover does, then re-cover a shorter scan.
         let pre_state = authenticate_pre_state(pre, &honest.pre_state).unwrap();
         let mut cache = TrustedMap::empty_cache(pre);
-        verify_and_merge_claims(
+        let claims = authenticate_and_merge_records(
             &pre_state,
             &mut cache,
             &honest.pre_state_claims,
-            &Sequential,
+            &honest.pre_state_candidates.operations,
+            honest.records_proof.as_ref(),
         )
         .unwrap();
         let points = expand_range_deletes(&cache, batch.ops()).unwrap();
@@ -286,6 +335,7 @@ fn a_shortened_scan_is_rejected<F: Graftable>() {
                 old_floor,
                 scan_end,
                 &prepared,
+                &claims,
                 db.bitmap(),
                 &db.any.log.merkle,
                 &grafted_storage,
@@ -297,8 +347,8 @@ fn a_shortened_scan_is_rejected<F: Graftable>() {
         forged.bitmap = recover(old_floor).await.unwrap();
         forged.pre_state_candidates = PreStateCandidateProof {
             operations: Vec::new(),
-            raw_multi_proof: None,
         };
+        reprove_records(&db, &mut forged).await;
         reject(
             "no floor scan",
             &batch,
@@ -313,17 +363,10 @@ fn a_shortened_scan_is_rejected<F: Graftable>() {
         let scan_end = first.0 + 1;
         let mut forged = honest.clone();
         forged.bitmap = recover(scan_end).await.unwrap();
-        let raw_multi_proof = crate::merkle::verification::multi_proof(
-            &db.any.log.merkle,
-            F::inactive_peaks(pre.size(), old_floor),
-            &[first.0],
-        )
-        .await
-        .unwrap();
         forged.pre_state_candidates = PreStateCandidateProof {
             operations: vec![first],
-            raw_multi_proof: Some(raw_multi_proof),
         };
+        reprove_records(&db, &mut forged).await;
         reject(
             "a scan through one candidate",
             &batch,
@@ -341,27 +384,16 @@ fn a_shortened_scan_is_rejected<F: Graftable>() {
         let scan_end = pre.size();
         let mut forged = honest.clone();
         forged.bitmap = recover(scan_end).await.unwrap();
-        let mut locations = Vec::new();
         let mut operations = Vec::new();
         for raw in db.bitmap().ones_iter_from(old_floor.as_u64()) {
             let location = Location::<F>::new(raw);
             if location >= pre.size() - 1 {
                 break;
             }
-            locations.push(location);
             operations.push((location, db.any.log.read(raw).await.unwrap()));
         }
-        let raw_multi_proof = crate::merkle::verification::multi_proof(
-            &db.any.log.merkle,
-            F::inactive_peaks(pre.size(), old_floor),
-            &locations,
-        )
-        .await
-        .unwrap();
-        forged.pre_state_candidates = PreStateCandidateProof {
-            operations,
-            raw_multi_proof: Some(raw_multi_proof),
-        };
+        forged.pre_state_candidates = PreStateCandidateProof { operations };
+        reprove_records(&db, &mut forged).await;
         reject(
             "a scan over the whole old log",
             &batch,

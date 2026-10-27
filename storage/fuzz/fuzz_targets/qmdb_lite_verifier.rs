@@ -37,13 +37,10 @@ use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use commonware_storage::{
     merkle::{Graftable, mmb, mmr},
     qmdb::{
-        current::{
-            ordered::proof::constant::ExclusionProof,
-            verifier::{
-                BatchProofBundle, BitmapFault, BitmapProof, BitmapUnit, BundleConfig,
-                CandidateFault, InsufficientPreState, PreStateKeyClaim, PreStateOpeningClaim,
-                TrustedMap, UserBatch, VerifyError,
-            },
+        current::verifier::{
+            BatchProofBundle, BitmapFault, BitmapProof, BitmapUnit, BundleConfig, CandidateFault,
+            InsufficientPreState, PreStateKeyClaim, PreStateOpeningClaim, TrustedMap, UserBatch,
+            VerifyError,
         },
         floor::{Bounded, Decision, Entry, Hold, Limits, Policy, Proportional},
     },
@@ -424,17 +421,27 @@ const GROWN_ZERO_SUBTREE: &[VerifyError] = &[
 
 /// The pre-state facts a batch needs were not established: range expansion runs first, and a
 /// range open below needs the record wrapping to the least key before anything is classified.
+/// Dropping claims also changes the records the shared proof covers, unless the candidates
+/// carry them all.
 const fn missing_facts(open_below: bool) -> &'static [VerifyError] {
     if open_below {
-        &[VerifyError::InsufficientPreState(
-            InsufficientPreState::OrderedEdge,
-        )]
+        &[
+            VerifyError::InsufficientPreState(InsufficientPreState::OrderedEdge),
+            VerifyError::InvalidRecordProof,
+        ]
     } else {
-        &[VerifyError::InsufficientPreState(
-            InsufficientPreState::Classification,
-        )]
+        &[
+            VerifyError::InsufficientPreState(InsufficientPreState::Classification),
+            VerifyError::InvalidRecordProof,
+        ]
     }
 }
+
+/// A changed record no longer matches the shared proof, or a copy of it at the same location.
+const CHANGED_RECORD: &[VerifyError] = &[
+    VerifyError::InvalidRecordProof,
+    VerifyError::ConflictingPreState,
+];
 
 /// Apply one invalid mutation and return the errors it may cause, or skip it when its required
 /// proof field is absent. Every mutation changes authenticated data or violates a required
@@ -451,7 +458,10 @@ fn corrupt<F: Graftable>(
         }
         1 => {
             proof.pre_state_candidates.operations.pop()?;
-            &[VerifyError::InvalidCandidates(CandidateFault::Locations)]
+            &[
+                VerifyError::InvalidCandidates(CandidateFault::Locations),
+                VerifyError::InvalidRecordProof,
+            ]
         }
         2 => {
             let (_, commonware_storage::qmdb::any::operation::Operation::Update(update)) =
@@ -460,7 +470,7 @@ fn corrupt<F: Graftable>(
                 return None;
             };
             flip_value(&mut update.value);
-            &[VerifyError::InvalidCandidates(CandidateFault::Proof)]
+            CHANGED_RECORD
         }
         3 | 4 => {
             let member = proof
@@ -473,9 +483,9 @@ fn corrupt<F: Graftable>(
             if fault == 3 {
                 flip_value(&mut member.value);
             } else {
-                flip_value(&mut member.proof.next_key);
+                flip_value(&mut member.next_key);
             }
-            &[VerifyError::InvalidMemberProof]
+            CHANGED_RECORD
         }
         5 => {
             match &mut proof.bitmap {
@@ -508,11 +518,13 @@ fn corrupt<F: Graftable>(
                     PreStateKeyClaim::Exclusion(exclusion) => Some(exclusion),
                     _ => None,
                 })?;
-            match &mut exclusion.proof {
-                ExclusionProof::KeyValue(_, update) => flip_value(&mut update.next_key),
-                ExclusionProof::Commit(_, metadata) => flip_metadata(metadata),
-            }
-            &[VerifyError::InvalidExclusionProof]
+            flip_value(&mut exclusion.owner.next_key);
+            // The changed link may stop spanning the queried key before the record is checked.
+            &[
+                VerifyError::InvalidExclusionProof,
+                VerifyError::InvalidRecordProof,
+                VerifyError::ConflictingPreState,
+            ]
         }
         11 => {
             proof.claims.pre_floor += 1;
@@ -575,11 +587,15 @@ fn corrupt<F: Graftable>(
         }
         19 => {
             proof.pre_state_candidates.operations.first_mut()?.0 += 1;
-            &[VerifyError::InvalidCandidates(CandidateFault::Locations)]
+            &[
+                VerifyError::InvalidCandidates(CandidateFault::Locations),
+                VerifyError::InvalidRecordProof,
+                VerifyError::ConflictingPreState,
+            ]
         }
         22 => {
-            proof.pre_state_candidates.raw_multi_proof.take()?;
-            &[VerifyError::InvalidCandidates(CandidateFault::Proof)]
+            proof.records_proof.take()?;
+            &[VerifyError::InvalidRecordProof]
         }
         23 => {
             proof
@@ -655,9 +671,10 @@ fn corrupt<F: Graftable>(
             // Drop every claim carrying the greatest key's record, which wraps to the least.
             let claims = proof.pre_state_claims.len();
             proof.pre_state_claims.retain(|claim| match claim {
-                PreStateKeyClaim::Member(member) => member.proof.next_key > member.key,
-                PreStateKeyClaim::Exclusion(exclusion) => !matches!(&exclusion.proof,
-                    ExclusionProof::KeyValue(_, update) if update.next_key <= update.key),
+                PreStateKeyClaim::Member(member) => member.next_key > member.key,
+                PreStateKeyClaim::Exclusion(exclusion) => {
+                    exclusion.owner.next_key > exclusion.owner.key
+                }
             });
             if proof.pre_state_claims.len() == claims {
                 return None;

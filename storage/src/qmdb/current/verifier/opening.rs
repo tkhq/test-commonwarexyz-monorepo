@@ -1,7 +1,7 @@
 //! Authenticate the root components that all later pre-state proofs must share.
 //!
 //! The terminal commit fixes the old floor. Its raw proof also authenticates the
-//! nodes needed to append to the log. Membership and bitmap proofs must agree with
+//! nodes needed to append to the log. Record and bitmap proofs must agree with
 //! this opening's raw root, grafted root, size, and trailing bitmap components.
 
 use super::{
@@ -16,7 +16,7 @@ use crate::{
             ValueEncoding,
             operation::{Operation, update},
         },
-        current::{grafting, proof::constant::OperationProof},
+        current::grafting,
         operation::Key,
     },
 };
@@ -42,8 +42,8 @@ where
     pub(crate) witness: crate::qmdb::current::proof::OpsRootWitness<F, H::Digest>,
     pub(crate) raw_frontier: BTreeMap<Position<F>, H::Digest>,
     /// Inactive-peak count for grafted proofs, rounded down so the whole prefix ends
-    /// at a complete bitmap-chunk boundary. Every operation proof must carry this
-    /// count; compute it once from the authenticated size and floor for all claims.
+    /// at a complete bitmap-chunk boundary. The bitmap's grafted proof must carry this
+    /// count; compute it once from the authenticated size and floor.
     pub(crate) grafted_inactive_peaks: usize,
     pub(crate) initial: bool,
 }
@@ -174,41 +174,4 @@ where
         grafted_inactive_peaks,
         initial: false,
     })
-}
-
-/// Authenticate an active operation against this transition's pre-state opening.
-///
-/// Member and exclusion claims use this check before adding a record's fields to
-/// the trusted cache. Inclusion alone would allow superseded records. Requiring a
-/// set activity bit establishes that the record is live at the trusted commitment.
-///
-/// Require the opening's size, raw root, trailing bitmap digests, and floor-derived
-/// inactive-peak count. The operation proof checks inclusion and a set activity bit.
-/// Its reconstructed grafted root must also equal the opening's grafted root. Callers
-/// separately restrict the operation location and payload to the kind of fact needed.
-pub(crate) fn operation_proof_matches_pre_state<F, K, V, H, const N: usize>(
-    pre: &AuthenticatedPreState<F, K, V, H, N>,
-    proof: &OperationProof<F, H::Digest, N>,
-    operation: &Operation<F, update::Ordered<K, V>>,
-) -> bool
-where
-    F: Graftable,
-    K: Key,
-    V: ValueEncoding,
-    H: Hasher,
-    Operation<F, update::Ordered<K, V>>: Codec,
-{
-    let range = &proof.range_proof;
-    let partial_digest = pre
-        .witness
-        .partial_chunk
-        .as_ref()
-        .map(|(_, digest)| *digest);
-    range.proof.leaves == pre.commitment.size()
-        && range.ops_root == pre.ops_root
-        && range.pending_chunk_digest == pre.witness.pending_chunk_digest
-        && range.partial_chunk_digest == partial_digest
-        && range.proof.inactive_peaks == pre.grafted_inactive_peaks
-        && proof.verify_and_reconstruct_grafted_root::<H, _>(operation, pre.commitment.root())
-            == Some(pre.witness.grafted_root)
 }

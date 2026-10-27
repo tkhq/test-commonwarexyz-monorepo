@@ -3,37 +3,37 @@
 //! An ordered update stores its key, value, and immediate cyclic successor. Inserting
 //! or deleting a key may therefore require rewriting a surviving predecessor even
 //! when the caller did not change its value. The proof bundle supplies pre-state
-//! records and proofs of membership or absence. This module authenticates those facts,
+//! records establishing membership or absence. This module authenticates those facts,
 //! then combines them with the trusted cache and the caller's `UserBatch` mutations
 //! to construct the new updates, deletes, and predecessor rewrites in canonical order.
 //! Floor copies and the terminal commit are derived in the floor stage that follows.
 
 use super::{
-    InsufficientPreState,
+    CandidateOperation, InsufficientPreState,
     OptionTrusted::{KnownTrusted, Unknown},
     PreStateKeyClaim, TrustedEntry, TrustedMap, TrustedState, UserOp, VerifyError,
-    opening::{AuthenticatedPreState, operation_proof_matches_pre_state},
+    bitmap::VerifiedBitmapView,
+    opening::AuthenticatedPreState,
     trusted::strict_span_contains,
     user::{ByStart, range_contains},
 };
 use crate::{
-    merkle::{Graftable, Location},
+    merkle::{self, Graftable, Location},
     qmdb::{
+        self,
         any::{
             ValueEncoding,
             operation::{Operation, update},
         },
-        current::ordered::proof::constant::ExclusionProof,
         operation::Key,
     },
 };
 use alloc::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, btree_map},
     vec::Vec,
 };
 use commonware_codec::{Codec, Encode as _};
-use commonware_cryptography::Hasher;
-use commonware_parallel::Strategy;
+use commonware_cryptography::{Digest, Hasher};
 use core::ops::Bound;
 
 /// Each mutated key with the value a set writes, or `None` for a delete, after range deletes
@@ -78,27 +78,57 @@ where
     .map_err(|_| VerifyError::ConflictingPreState)
 }
 
-/// None authenticates an empty database; Some carries an active record and whether
-/// its edge was requested explicitly as an exclusion. This is never proof input.
-type AuthenticatedClaim<F, K, V> = Option<(Location<F>, update::Ordered<K, V>, bool)>;
+/// A claim's location and record, and whether it is an exclusion.
+type ClaimedRecord<F, K, V> = (Location<F>, update::Ordered<K, V>, bool);
 
-/// Authenticate one member or exclusion before it may be merged into the cache.
+/// The record a claim supplies. An exclusion's record must span its queried key.
+fn claim_record<F, K, V>(
+    claim: &PreStateKeyClaim<F, K, V>,
+) -> Result<ClaimedRecord<F, K, V>, VerifyError>
+where
+    F: Graftable,
+    K: Key,
+    V: ValueEncoding,
+{
+    match claim {
+        PreStateKeyClaim::Member(claim) => Ok((
+            claim.location,
+            update::Ordered {
+                key: claim.key.clone(),
+                value: claim.value.clone(),
+                next_key: claim.next_key.clone(),
+            },
+            false,
+        )),
+        PreStateKeyClaim::Exclusion(claim) => {
+            if !strict_span_contains(&claim.owner.key, &claim.owner.next_key, &claim.queried_key) {
+                return Err(VerifyError::InvalidExclusionProof);
+            }
+            Ok((claim.location, claim.owner.clone(), true))
+        }
+    }
+}
+
+/// Authenticate the payload of every pre-state record the bundle supplies, the key claims'
+/// records and the floor candidates, with the bundle's one shared raw multi-proof, and merge
+/// the claims into the cache.
 ///
-/// Operation derivation needs to distinguish updates and deletes of existing keys
-/// from creations and deletes of absent keys. A member proof establishes a live
-/// update at a location between the floor and terminal. An exclusion establishes
-/// an active predecessor whose open successor interval contains the queried key,
-/// or an empty database whose terminal is at the floor.
+/// Inclusion alone does not make a record current: a superseded record stays in the log.
+/// The caller checks each claim's activity bit against the verified bitmap, with
+/// [`check_claim_activity`], before accepting the transition, and the candidates'
+/// completeness with [`super::floor::verify_candidates`]. A location that two claims, or a
+/// claim and a candidate, share must carry one payload. Return the claims' distinct
+/// locations, whose chunks the bitmap proof must cover.
 ///
-/// Require the same root components as the pre-state opening before adding facts to
-/// the cache. The activity check prevents an old, superseded record from establishing
-/// current membership or absence. An exclusion's predecessor also supplies its
-/// location, value, and successor for any required predecessor rewrite.
-/// Cache conflicts are checked by the ordered merge after authentication.
-fn authenticate_claim<F, K, V, H, const N: usize>(
+/// Claims merge in their original order. An error may follow successful earlier merges, so
+/// the caller must discard the working cache on failure.
+pub(crate) fn authenticate_and_merge_records<F, K, V, H, const N: usize>(
     pre: &AuthenticatedPreState<F, K, V, H, N>,
-    claim: &PreStateKeyClaim<F, K, V, H::Digest, N>,
-) -> Result<AuthenticatedClaim<F, K, V>, VerifyError>
+    map: &mut TrustedMap<F, K, V, H, N>,
+    claims: &[PreStateKeyClaim<F, K, V>],
+    candidates: &[CandidateOperation<F, K, V>],
+    proof: Option<&merkle::Proof<F, H::Digest>>,
+) -> Result<BTreeSet<Location<F>>, VerifyError>
 where
     F: Graftable,
     K: Key,
@@ -106,91 +136,87 @@ where
     H: Hasher,
     Operation<F, update::Ordered<K, V>>: Codec,
 {
-    let (proof, update, exclusion) = match claim {
-        PreStateKeyClaim::Member(claim) => (
-            &claim.proof.proof,
-            update::Ordered {
-                key: claim.key.clone(),
-                value: claim.value.clone(),
-                next_key: claim.proof.next_key.clone(),
-            },
-            false,
-        ),
-        PreStateKeyClaim::Exclusion(claim) => match &claim.proof {
-            ExclusionProof::KeyValue(proof, update) => {
-                if !strict_span_contains(&update.key, &update.next_key, &claim.queried_key) {
-                    return Err(VerifyError::InvalidExclusionProof);
-                }
-                (proof, update.clone(), true)
-            }
-            ExclusionProof::Commit(proof, metadata) => {
-                if proof.loc != pre.terminal_location
-                    || pre.old_floor != proof.loc
-                    || !operation_proof_matches_pre_state(
-                        pre,
-                        proof,
-                        &Operation::<F, update::Ordered<K, V>>::CommitFloor(
-                            metadata.clone(),
-                            proof.loc,
-                        ),
-                    )
-                {
-                    return Err(VerifyError::InvalidExclusionProof);
-                }
-                return Ok(None);
-            }
-        },
-    };
-    let operation = Operation::Update(update);
-    let authentic = proof.loc >= pre.old_floor
-        && proof.loc < pre.terminal_location
-        && operation_proof_matches_pre_state(pre, proof, &operation);
-    match operation {
-        Operation::Update(update) if authentic => Ok(Some((proof.loc, update, exclusion))),
-        _ if exclusion => Err(VerifyError::InvalidExclusionProof),
-        _ => Err(VerifyError::InvalidMemberProof),
+    let mut records = BTreeMap::new();
+    let mut claimed = Vec::with_capacity(claims.len());
+    for claim in claims {
+        let (location, update, exclusion) = claim_record(claim)?;
+        if location < pre.old_floor || location >= pre.terminal_location {
+            return Err(if exclusion {
+                VerifyError::InvalidExclusionProof
+            } else {
+                VerifyError::InvalidMemberProof
+            });
+        }
+        insert_record(&mut records, location, Operation::Update(update.clone()))?;
+        claimed.push((location, update, exclusion));
     }
+    for (location, operation) in candidates {
+        insert_record(&mut records, *location, operation.clone())?;
+    }
+    let operations = records.into_iter().collect::<Vec<_>>();
+    let authentic = proof.map_or(operations.is_empty(), |raw| {
+        !operations.is_empty()
+            && raw.leaves == pre.commitment.size()
+            && raw.inactive_peaks == F::inactive_peaks(pre.commitment.size(), pre.old_floor)
+            && qmdb::verify_multi_proof::<H, F, _>(raw, &operations, &pre.ops_root)
+    });
+    if !authentic {
+        return Err(VerifyError::InvalidRecordProof);
+    }
+    let mut locations = BTreeSet::new();
+    for (location, update, exclusion) in claimed {
+        locations.insert(location);
+        let edge = exclusion.then(|| (update.key.clone(), update.next_key.clone()));
+        merge_member(map, location, update)?;
+        if let Some((key, next_key)) = edge {
+            map.install_span(key, next_key)
+                .map_err(|_| VerifyError::ConflictingPreState)?;
+        }
+    }
+    Ok(locations)
 }
 
-/// Authenticate supplied facts independently, then merge them in their original order.
-/// Workers never mutate the cache, and no fact is merged unless all authentication
-/// succeeds. Missing or invalid proofs reject the batch under every strategy.
-/// The resulting cache supplies the membership, absence, and adjacency facts used
-/// to derive the application operations. The caller rejects repeated queried keys
-/// before this loop. An error may follow successful earlier merges, so the caller
-/// must discard the working cache on failure.
-pub(crate) fn verify_and_merge_claims<F, K, V, H, const N: usize, S: Strategy>(
-    pre: &AuthenticatedPreState<F, K, V, H, N>,
-    map: &mut TrustedMap<F, K, V, H, N>,
-    claims: &[PreStateKeyClaim<F, K, V, H::Digest, N>],
-    strategy: &S,
+/// Add one supplied record to the set the shared proof covers; a location supplied twice
+/// must carry the same payload.
+fn insert_record<F, K, V>(
+    records: &mut BTreeMap<Location<F>, Operation<F, update::Ordered<K, V>>>,
+    location: Location<F>,
+    operation: Operation<F, update::Ordered<K, V>>,
 ) -> Result<(), VerifyError>
 where
     F: Graftable,
     K: Key,
     V: ValueEncoding,
-    H: Hasher,
     Operation<F, update::Ordered<K, V>>: Codec,
 {
-    let verified = strategy.try_map_collect_vec(claims, |claim| authenticate_claim(pre, claim))?;
-    for claim in verified {
-        if let Some((location, update, exclusion)) = claim {
-            let edge = exclusion.then(|| (update.key.clone(), update.next_key.clone()));
-            merge_member(map, location, update)?;
-            if let Some((key, next_key)) = edge {
-                map.install_span(key, next_key)
-                    .map_err(|_| VerifyError::ConflictingPreState)?;
-            }
-        } else {
-            if let TrustedState::Partial(partial) = map.state()
-                && (partial.entries().next().is_some() || !partial.absences().is_empty())
-            {
-                return Err(VerifyError::ConflictingPreState);
-            }
-            map.set_state(TrustedState::EmptyDatabase);
+    match records.entry(location) {
+        btree_map::Entry::Vacant(entry) => {
+            entry.insert(operation);
+            Ok(())
         }
+        btree_map::Entry::Occupied(entry) if entry.get().encode() == operation.encode() => Ok(()),
+        btree_map::Entry::Occupied(_) => Err(VerifyError::ConflictingPreState),
     }
-    Ok(())
+}
+
+/// Require every claimed record to be active in the pre-state, as the verified bitmap shows.
+/// The bitmap proof covers each claim's chunk, so an uncovered bit is a defect of the proof.
+pub(crate) fn check_claim_activity<F, D, const N: usize>(
+    bitmap: &VerifiedBitmapView<F, D, N>,
+    claimed: &BTreeSet<Location<F>>,
+) -> Result<(), VerifyError>
+where
+    F: Graftable,
+    D: Digest,
+{
+    if claimed
+        .iter()
+        .all(|location| bitmap.bit(*location) == Some(true))
+    {
+        Ok(())
+    } else {
+        Err(VerifyError::InactiveClaim)
+    }
 }
 
 /// Cached fields needed to invalidate a record and derive its replacement or deletion.

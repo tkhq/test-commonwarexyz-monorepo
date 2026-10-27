@@ -75,18 +75,21 @@
 //! 1. Check the supplied raw root and bitmap components against the trusted root.
 //!    Authenticate the final `CommitFloor` and the raw append frontier (the nodes
 //!    needed to append to the tree), binding the old floor and log size.
-//! 2. Authenticate active ordered records and exclusion intervals against that same
-//!    opening. Merge only consistent facts into the cache. An active record's cyclic
-//!    successor proves that the open interval between the two keys contains no active key.
+//! 2. Authenticate every supplied old record, the key claims' and the floor candidates',
+//!    with one shared raw multi-proof against that same opening. Merge only consistent
+//!    claims into the cache. An active record's cyclic successor proves that the open
+//!    interval between the two keys contains no active key; inclusion alone does not make
+//!    a record active, which step 4 establishes.
 //! 3. Classify each requested mutation and derive the application operations,
 //!    including predecessor rewrites. The batch keeps delete ranges normalized;
 //!    follow authenticated successor edges through each interval to enumerate every
 //!    deleted member. A range with no lower bound starts at the least key, which the
 //!    greatest key's wrapping successor edge proves. Missing facts cause an error,
 //!    never a guess.
-//! 4. Authenticate every bitmap region needed for invalidations, appends, and the
-//!    floor scan. Exact coverage prevents omitted live bits. Raw and grafted proofs
-//!    jointly authenticate explicit chunks and compressed all-zero intervals.
+//! 4. Authenticate every bitmap region needed for invalidations, appends, the floor
+//!    scan, and the claimed records. Exact coverage prevents omitted live bits. Raw and
+//!    grafted proofs jointly authenticate explicit chunks and compressed all-zero
+//!    intervals. Every claimed record's bit must be set.
 //! 5. Require candidate payloads at every set bit in the scan, except the separately
 //!    authenticated terminal. Replay the caller's floor policy to derive the floor and
 //!    the copies, and require the claimed scan endpoint to match the replay's stopping
@@ -145,13 +148,13 @@
 //! O(d + h) temporary space beyond the node maps. Updating every chunk takes O(L + h)
 //! visits. The maps are consumed directly. Authentication of the supplied proofs
 //! remains separate, so this saving does not change the overall upper bounds above.
-//! Floor-candidate authentication shares both witness planning and hashing. For
-//! `f > 0` candidates its tree traversal visits O(f * (1 + log(n / f)) + h) nodes;
-//! sorting and witness-position searches add logarithmic factors. Individual key
-//! proofs still authenticate their own paths, so the overall upper bounds above
-//! remain conservative. See [`crate::merkle::Proof::verify_multi_inclusion`].
+//! Record authentication shares both witness planning and hashing across the claims and
+//! candidates. For `q = p + f > 0` records its tree traversal visits
+//! O(q * (1 + log(n / q)) + h) nodes; sorting and witness-position searches add logarithmic
+//! factors, so the overall upper bounds above remain conservative. See
+//! [`crate::merkle::Proof::verify_multi_inclusion`].
 //!
-//! The bundled prover supplies complete key proofs and proves each run of clear bitmap
+//! The bundled prover supplies complete key claims and proves each run of clear bitmap
 //! chunks with the fewest aligned zero subtrees. The floor-copy policy's entry limit
 //! bounds the live records the scan reaches, not the inactive bits it crosses, but those
 //! bits cost O(log n) units per run. Thus `p`, `f`, and `u` are O(k) up to that logarithmic

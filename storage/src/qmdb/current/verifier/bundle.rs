@@ -8,7 +8,7 @@ use crate::{
             ValueEncoding,
             operation::{Operation, update},
         },
-        current::{ordered, proof::OpsRootWitness},
+        current::proof::OpsRootWitness,
         operation::Key,
     },
 };
@@ -80,83 +80,82 @@ where
     pub pins_before_terminal: Vec<D>,
 }
 
-/// Claim that `key` has `value` at an active location in the pre-state.
-/// The membership proof supplies the location and immediate cyclic successor. The
-/// verifier authenticates the reconstructed update, its activity bit, and its
-/// agreement with the common pre-state opening before adding it to the cache.
+/// Claim that `key` has `value` and successor `next_key` at `location`, an active location
+/// in the pre-state. The bundle's shared raw multi-proof authenticates the record at its
+/// location, and the bitmap proof its activity bit, before the verifier relies on it.
 #[derive(Clone)]
-pub struct PreStateMemberClaim<F, K, V, D, const N: usize>
+pub struct PreStateMemberClaim<F, K, V>
 where
-    F: Graftable,
+    F: Family,
     K: Key,
-    D: Digest,
 {
+    /// Claimed location of the member's active record.
+    pub location: Location<F>,
     /// Claimed member key.
     pub key: K,
     /// Claimed member value.
     pub value: V,
-    /// Ordered Current membership proof containing the location and successor.
-    pub proof: ordered::proof::constant::KeyValueProof<F, K, D, N>,
+    /// Claimed immediate cyclic successor.
+    pub next_key: K,
 }
 
-/// Claim that `queried_key` is absent from the pre-state's active keys.
-/// A key-value proof authenticates the active predecessor and its successor, whose
-/// open cyclic interval must contain the queried key. A commit proof establishes
-/// an empty database by placing the terminal commit at the inactivity floor.
+/// Claim that `queried_key` is absent from the pre-state's active keys: `owner`, the active
+/// record at `location`, has a successor link whose open cyclic interval contains it. The
+/// record is authenticated as a member's is. An empty pre-state needs no claim: its opening
+/// places the terminal commit at the inactivity floor.
 #[derive(Clone)]
-pub struct PreStateExclusionClaim<F, K, V, D, const N: usize>
-where
-    F: Graftable,
-    K: Key,
-    V: ValueEncoding,
-    D: Digest,
-{
-    /// Key claimed to be absent.
-    pub queried_key: K,
-    /// Ordered Current exclusion proof containing a predecessor or an empty-state commit.
-    pub proof: ordered::proof::constant::ExclusionProof<F, K, V, D, N>,
-}
-
-/// One untrusted ordered pre-state fact supplied by the prover.
-#[derive(Clone)]
-pub enum PreStateKeyClaim<F, K, V, D, const N: usize>
-where
-    F: Graftable,
-    K: Key,
-    V: ValueEncoding,
-    D: Digest,
-{
-    /// Claimed active record.
-    Member(PreStateMemberClaim<F, K, V::Value, D, N>),
-    /// Claimed absent key.
-    Exclusion(PreStateExclusionClaim<F, K, V, D, N>),
-}
-
-/// Raw payload proof for every pre-state live bit in the proposed floor scan.
-/// Locations must equal the bitmap's set bits in `[old_floor, floor_scan_end)`,
-/// excluding the terminal commit. This excludes omitted candidates as well as
-/// extras. Inclusion alone would not prove scan completeness. All payloads must
-/// be updates. The floor stage decides which remain live after the user batch.
-#[derive(Clone)]
-pub struct PreStateCandidateProof<F, K, V, D>
+pub struct PreStateExclusionClaim<F, K, V>
 where
     F: Family,
     K: Key,
     V: ValueEncoding,
-    D: Digest,
+{
+    /// Key claimed to be absent.
+    pub queried_key: K,
+    /// Claimed location of the spanning record.
+    pub location: Location<F>,
+    /// Claimed active record whose successor link spans the queried key.
+    pub owner: update::Ordered<K, V>,
+}
+
+/// One untrusted ordered pre-state fact supplied by the prover.
+#[derive(Clone)]
+pub enum PreStateKeyClaim<F, K, V>
+where
+    F: Family,
+    K: Key,
+    V: ValueEncoding,
+{
+    /// Claimed active record.
+    Member(PreStateMemberClaim<F, K, V::Value>),
+    /// Claimed absent key.
+    Exclusion(PreStateExclusionClaim<F, K, V>),
+}
+
+/// Old payloads for every pre-state live bit in the proposed floor scan.
+/// Locations must equal the bitmap's set bits in `[old_floor, floor_scan_end)`,
+/// excluding the terminal commit. This excludes omitted candidates as well as
+/// extras. Inclusion alone would not prove scan completeness. All payloads must
+/// be updates. The floor stage decides which remain live after the user batch.
+/// The bundle's shared raw multi-proof authenticates the payloads.
+#[derive(Clone)]
+pub struct PreStateCandidateProof<F, K, V>
+where
+    F: Family,
+    K: Key,
+    V: ValueEncoding,
 {
     /// Claimed operations, required to be strictly increasing by location.
     pub operations: Vec<CandidateOperation<F, K, V>>,
-    /// Shared raw operations-tree proof, present exactly when `operations` is non-empty.
-    pub raw_multi_proof: Option<merkle::Proof<F, D>>,
 }
 
 /// Evidence supplied by a prover for verification with [`super::UserBatch::verify`].
 ///
 /// The opening supplies the old root components and terminal commit. Key claims
-/// supply records and proofs of membership or absence to fill gaps in the cache.
+/// supply records establishing membership or absence to fill gaps in the cache.
 /// Bitmap proofs and candidate payloads let the verifier replay floor movement and
-/// compute the new root. Verification checks the claimed bounds and scan endpoint
+/// compute the new root. One raw multi-proof authenticates every record the claims and
+/// candidates carry; the bitmap proof establishes which of them are active. Verification checks the claimed bounds and scan endpoint
 /// against that execution.
 ///
 /// These fields describe the pre-state and claim bounds for the transition. The
@@ -180,11 +179,14 @@ where
     /// Root components, terminal commit, and proof of the raw append frontier.
     pub pre_state: PreStateOpeningClaim<F, V, H::Digest, N>,
     /// Member and exclusion claims to authenticate before adding facts to the cache.
-    pub pre_state_claims: Vec<PreStateKeyClaim<F, K, V, H::Digest, N>>,
-    /// Proof covering every bitmap chunk needed by the transition.
+    pub pre_state_claims: Vec<PreStateKeyClaim<F, K, V>>,
+    /// Proof covering every bitmap chunk needed by the transition, including each claim's.
     pub bitmap: BitmapProof<F, H::Digest, N>,
-    /// Old operation payloads and inclusion proof for the floor scan's set bits.
-    pub pre_state_candidates: PreStateCandidateProof<F, K, V, H::Digest>,
+    /// Old operation payloads for the floor scan's set bits.
+    pub pre_state_candidates: PreStateCandidateProof<F, K, V>,
+    /// Raw operations-tree multi-proof over the distinct locations of the claims' records and
+    /// the candidates, present exactly when there is at least one.
+    pub records_proof: Option<merkle::Proof<F, H::Digest>>,
 }
 
 impl<F, K, V, H, const N: usize> Clone for BatchProofBundle<F, K, V, H, N>
@@ -202,6 +204,7 @@ where
             pre_state_claims: self.pre_state_claims.clone(),
             bitmap: self.bitmap.clone(),
             pre_state_candidates: self.pre_state_candidates.clone(),
+            records_proof: self.records_proof.clone(),
         }
     }
 }
@@ -219,9 +222,10 @@ where
     pub const fn new(
         claims: ClaimedBatchBounds<F>,
         pre_state: PreStateOpeningClaim<F, V, H::Digest, N>,
-        pre_state_claims: Vec<PreStateKeyClaim<F, K, V, H::Digest, N>>,
+        pre_state_claims: Vec<PreStateKeyClaim<F, K, V>>,
         bitmap: BitmapProof<F, H::Digest, N>,
-        pre_state_candidates: PreStateCandidateProof<F, K, V, H::Digest>,
+        pre_state_candidates: PreStateCandidateProof<F, K, V>,
+        records_proof: Option<merkle::Proof<F, H::Digest>>,
     ) -> Self {
         Self {
             claims,
@@ -229,6 +233,7 @@ where
             pre_state_claims,
             bitmap,
             pre_state_candidates,
+            records_proof,
         }
     }
 }
