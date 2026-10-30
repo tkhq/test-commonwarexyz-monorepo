@@ -32,12 +32,12 @@ use std::{
     rc::Rc,
 };
 
-type Key = FixedBytes<8>;
+pub(super) type Key = FixedBytes<8>;
 type Commitment<F> = CurrentCommitment<F, Key, FixedEncoding<Key>, Sha256, 32>;
 type Bundle<F> = BatchProofBundle<F, Key, FixedEncoding<Key>, Sha256, 32>;
 type Digest = <Sha256 as Hasher>::Digest;
 type Unit<F> = BitmapUnit<F, Digest, 32>;
-type Batch = UserBatch<Key, Key>;
+pub(super) type Batch = UserBatch<Key, Key>;
 type TestDb<F, S> = Db<F, deterministic::Context, Key, Key, Sha256, OneCap, 32, S>;
 /// Applies a forgery to a bundle's bitmap units.
 type ChangeUnits<'a, F> = &'a dyn Fn(&mut Vec<Unit<F>>);
@@ -51,11 +51,11 @@ std::thread_local! {
     static FORGED: RefCell<BTreeSet<String>> = const { RefCell::new(BTreeSet::new()) };
 }
 
-fn key(value: u64) -> Key {
+pub(super) fn key(value: u64) -> Key {
     Key::from(value.to_be_bytes())
 }
 
-fn index(key: &Key) -> u64 {
+pub(super) fn index(key: &Key) -> u64 {
     let mut bytes = [0; 8];
     bytes.copy_from_slice(key.as_ref());
     u64::from_be_bytes(bytes)
@@ -70,7 +70,7 @@ fn flipped(value: &Key) -> Key {
 }
 
 /// Hand-written edge cases followed by seeded batches of sets, deletes and range deletes.
-fn batches() -> Vec<Batch> {
+pub(super) fn batches() -> Vec<Batch> {
     let mut batches = vec![UserBatch::new()]; // Empty metadata-only transition.
     let mut insert = UserBatch::new();
     for i in 0..600 {
@@ -142,7 +142,7 @@ fn clear_run_batches() -> (Vec<Batch>, Vec<Batch>) {
 }
 
 /// Apply `batch` to the model of the database's keys and values.
-fn apply_model(expected: &mut BTreeMap<Key, Key>, batch: &Batch) {
+pub(super) fn apply_model<A: Clone>(expected: &mut BTreeMap<Key, A>, batch: &UserBatch<Key, A>) {
     for operation in batch.iter() {
         match operation {
             UserOp::Set { key, value } => {
@@ -159,7 +159,7 @@ fn apply_model(expected: &mut BTreeMap<Key, Key>, batch: &Batch) {
 }
 
 /// One more than the largest key any of `batches` names.
-fn keyspace(batches: &[Batch]) -> u64 {
+pub(super) fn keyspace<A: Clone>(batches: &[UserBatch<Key, A>]) -> u64 {
     batches
         .iter()
         .flat_map(|batch| batch.iter())
@@ -919,9 +919,9 @@ where
 /// Keeps updates, but stops the walk at every `period`th one it is asked about, counting across
 /// batches, so the writer and the verifier must advance its state alike.
 #[derive(Clone, Debug, PartialEq)]
-struct StopEvery {
-    period: usize,
-    seen: usize,
+pub(super) struct StopEvery {
+    pub(super) period: usize,
+    pub(super) seen: usize,
 }
 
 impl<F: Graftable> Policy<F, Key, Key> for StopEvery {
@@ -1389,13 +1389,26 @@ type VariableDb<F, S> = crate::qmdb::current::ordered::variable::Db<
     S,
 >;
 
+/// A pending batch of a database with values encoded by `V`.
+type PendingBatch<F, V, S> = std::sync::Arc<
+    crate::qmdb::current::batch::MerkleizedBatch<
+        F,
+        Digest,
+        crate::qmdb::any::operation::update::Ordered<Key, V>,
+        32,
+        S,
+    >,
+>;
+
 // Callers spawn proof construction, so its futures must be `Send` for every family, strategy
 // and policy the prover accepts, including a policy that is not `Sync`, with fixed and
-// variable values.
+// variable values, from the database and on a pending batch.
 #[allow(dead_code)]
 fn assert_prover_futures_are_send<F: Graftable, S: Strategy, P>(
     fixed: &TestDb<F, S>,
+    fixed_parent: &PendingBatch<F, FixedEncoding<Key>, S>,
     variable: &VariableDb<F, S>,
+    variable_parent: &PendingBatch<F, crate::qmdb::any::value::VariableEncoding<Vec<u8>>, S>,
     batch: &Batch,
     values: &UserBatch<Key, Vec<u8>>,
     policy: &mut P,
@@ -1404,6 +1417,10 @@ fn assert_prover_futures_are_send<F: Graftable, S: Strategy, P>(
 {
     assert_send(batch.prove(fixed, policy));
     assert_send(batch.build_batch_proof(fixed, policy));
+    assert_send(batch.prove_on(fixed_parent, fixed, policy));
+    assert_send(batch.build_batch_proof_on(fixed_parent, fixed, policy));
     assert_send(values.prove(variable, policy));
     assert_send(values.build_batch_proof(variable, policy));
+    assert_send(values.prove_on(variable_parent, variable, policy));
+    assert_send(values.build_batch_proof_on(variable_parent, variable, policy));
 }

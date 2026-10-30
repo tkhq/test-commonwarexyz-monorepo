@@ -16,8 +16,15 @@
 //! checkpoint. The client independently calls [`UserBatch::verify`] before accepting that
 //! state. Proof production never changes the database.
 //!
-//! The prover works from the database's current state, the only one its key index, activity
-//! bitmap, and grafted tree hold. To prove a batch applied at an older checkpoint whose
+//! A writer that merkleizes batches ahead of applying them can prove each on top of the one
+//! before: `UserBatch::prove_on` takes a pending batch the database created and has not
+//! applied, and returns the bundle and batch `UserBatch::prove` returns once that batch is
+//! applied. Its reads consult the chain's changes before the database, as a batch's own reads
+//! do, so the database may apply the chain's batches meanwhile. Applying any other batch
+//! leaves the chain stale.
+//!
+//! The prover otherwise works from the database's current state, the only one its key index,
+//! activity bitmap, and grafted tree hold. To prove a batch applied at an older checkpoint whose
 //! operations the database still retains, sync a scratch database to that checkpoint from the
 //! live one with `qmdb::sync::sync`. The checkpoint's commit, proved against the old size with
 //! `Db::ops_historical_proof`, gives the target's ops root and floor, and the sync starts at or
@@ -192,10 +199,15 @@
 #[cfg(test)]
 #[cfg(feature = "std")]
 mod attack_tests;
+#[cfg(feature = "std")]
+mod base;
 mod bitmap;
 #[cfg(feature = "std")]
 mod builder;
 mod bundle;
+#[cfg(test)]
+#[cfg(feature = "std")]
+mod chain_tests;
 mod codec;
 mod commitment;
 mod error;
