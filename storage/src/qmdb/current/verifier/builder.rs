@@ -31,7 +31,7 @@ use commonware_codec::Codec;
 use commonware_cryptography::Hasher;
 use commonware_parallel::Strategy;
 use commonware_utils::{NZU64, bitmap::Readable as _, futures::try_join_all};
-use futures::{StreamExt as _, pin_mut};
+use futures::{StreamExt as _, pin_mut, try_join};
 use std::{
     collections::{BTreeMap, BTreeSet},
     ops::Bound,
@@ -106,21 +106,26 @@ impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
             return Err(BuildError::UnsupportedFloorPolicy);
         }
         let replay = policy.clone();
-        let expanded = self.expand_from_db(db).await?;
-        let mut writer = db.new_batch();
-        for (key, value) in &expanded {
-            writer = writer.write(key.clone(), value.cloned());
-        }
-        let batch = writer
-            .merkleize(db, self.metadata().cloned(), policy)
-            .await?;
+        // The opening reads only the pre-state, so it runs beside range expansion and the
+        // writer.
+        let merkleize = async {
+            let expanded = self.expand_from_db(db).await?;
+            let mut writer = db.new_batch();
+            for (key, value) in &expanded {
+                writer = writer.write(key.clone(), value.cloned());
+            }
+            let batch = writer
+                .merkleize(db, self.metadata().cloned(), policy)
+                .await?;
+            Ok::<_, BuildError<F>>((expanded, batch))
+        };
+        let ((expanded, batch), (pre_state, old_floor)) =
+            try_join!(merkleize, build_opening(db, commitment))?;
 
-        let (pre_state, old_floor) = build_opening(db, commitment).await?;
         let old = read_old_records(db, &batch.inner.diff).await?;
         let prepared = prepare_from_batch(&expanded, &batch, &old)?;
         check_policy(&replay, prepared.made_inactive())
             .map_err(|_| BuildError::UnsupportedFloorPolicy)?;
-        let pre_state_claims = self.claims(db, &expanded, &prepared, &old).await?;
 
         let known = old
             .iter()
@@ -128,10 +133,22 @@ impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
             .collect::<BTreeMap<_, _>>();
         #[cfg(feature = "prover-self-check")]
         let mut check = replay.clone();
-        let walked =
-            build_candidate_proof(db, &prepared, &known, commitment.size(), old_floor, replay)
-                .await?;
-        // One raw multi-proof covers every record the claims and candidates carry.
+        // Claims and floor candidates both read the pre-state for the prepared batch, and
+        // neither needs the other.
+        let (pre_state_claims, walked) = try_join!(
+            self.claims(db, &expanded, &prepared, &old),
+            build_candidate_proof(db, &prepared, &known, commitment.size(), old_floor, replay,),
+        )?;
+        let bounds = batch.bounds();
+        if child_size(commitment.size(), &prepared, walked.copies)? != bounds.tip.size
+            || walked.floor != bounds.inactivity_floor
+        {
+            return Err(BuildError::InvalidState(
+                "the prover's floor replay differs from the batch's walk",
+            ));
+        }
+        // One raw multi-proof covers every record the claims and candidates carry. The
+        // bitmap proof needs the same claims and the walk's end, but not the multi-proof.
         let claimed = pre_state_claims
             .iter()
             .map(|claim| match claim {
@@ -148,37 +165,32 @@ impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
                 .map(|(location, _)| *location),
         );
         let records = records.into_iter().collect::<Vec<_>>();
-        let records_proof = if records.is_empty() {
-            None
-        } else {
-            Some(
-                merkle::verification::multi_proof(
-                    &db.any.log.merkle,
-                    F::inactive_peaks(commitment.size(), old_floor),
-                    &records,
-                )
-                .await?,
+        let records_proof = async {
+            if records.is_empty() {
+                return Ok(None);
+            }
+            let proof = merkle::verification::multi_proof(
+                &db.any.log.merkle,
+                F::inactive_peaks(commitment.size(), old_floor),
+                &records,
             )
+            .await?;
+            Ok::<_, BuildError<F>>(Some(proof))
         };
-        let bounds = batch.bounds();
-        if child_size(commitment.size(), &prepared, walked.copies)? != bounds.tip.size
-            || walked.floor != bounds.inactivity_floor
-        {
-            return Err(BuildError::InvalidState(
-                "the prover's floor replay differs from the batch's walk",
-            ));
-        }
-        let bitmap = build_bitmap_proof::<F, K, V, H, _, _, _, N>(
-            commitment.size(),
-            old_floor,
-            walked.scan_end,
-            &prepared,
-            &claimed,
-            db.bitmap(),
-            &db.any.log.merkle,
-            &db.grafted_storage(),
-        )
-        .await?;
+        let grafted = db.grafted_storage();
+        let (records_proof, bitmap) = try_join!(
+            records_proof,
+            build_bitmap_proof::<F, K, V, H, _, _, _, N>(
+                commitment.size(),
+                old_floor,
+                walked.scan_end,
+                &prepared,
+                &claimed,
+                db.bitmap(),
+                &db.any.log.merkle,
+                &grafted,
+            ),
+        )?;
         let bundle = BatchProofBundle::new(
             ClaimedBatchBounds {
                 pre_size: commitment.size(),
