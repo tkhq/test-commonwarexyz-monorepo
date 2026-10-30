@@ -124,10 +124,10 @@ impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
     /// record costs a binary search in each, O(j * log(d_j + 2)), before the database's
     /// lookup. A span owner or predecessor also scans past deletions in each batch to its
     /// nearest live entry, and finds that entry's operation from the newest batch down:
-    /// O(j * (log(d_j + 2) + x_j) + j^2). A range enumeration finds its lower bound's span
-    /// owner, then follows successor links, one key's record per active key in the range,
-    /// instead of scanning the database's keys. Finding the least key also scans each batch's
-    /// diff up to its least key no newer batch changed, O(j^2 * d_j * log(d_j + 2)) at worst.
+    /// O(j * (log(d_j + 2) + x_j) + j^2). A range enumeration takes its lower bound's span
+    /// owner and then one key's record per active key in the range, as without a chain, so
+    /// keys the chain deleted cost nothing. Finding the least key also scans each batch's diff
+    /// up to its least key no newer batch changed, O(j^2 * d_j * log(d_j + 2)) at worst.
     #[allow(clippy::type_complexity)]
     pub async fn prove_on<F, E, C, V, I, H, P, const N: usize, S>(
         &self,
