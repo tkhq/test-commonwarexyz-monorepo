@@ -124,8 +124,10 @@ impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
     /// record costs a binary search in each, O(j * log(d_j + 2)), before the database's
     /// lookup. A span owner or predecessor also scans past deletions in each batch to its
     /// nearest live entry, and finds that entry's operation from the newest batch down:
-    /// O(j * (log(d_j + 2) + x_j) + j^2). A range enumeration merges the batches' changes in
-    /// the range, and finding the least key merges all of them.
+    /// O(j * (log(d_j + 2) + x_j) + j^2). A range enumeration finds its lower bound's span
+    /// owner, then follows successor links, one key's record per active key in the range,
+    /// instead of scanning the database's keys. Finding the least key also scans each batch's
+    /// diff up to its least key no newer batch changed, O(j^2 * d_j * log(d_j + 2)) at worst.
     #[allow(clippy::type_complexity)]
     pub async fn prove_on<F, E, C, V, I, H, P, const N: usize, S>(
         &self,
@@ -522,8 +524,16 @@ impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
         P: Policy<F, K, A> + Send,
         Operation<F, OrderedUpdate<K, V>>: Codec,
     {
+        // Without pending batches, range reads fail only in storage.
+        let expanded = self
+            .expand(&Base::db(db))
+            .await
+            .map_err(|error| match error {
+                BuildError::Database(error) => error,
+                _ => qmdb::Error::DataCorrupted("range expansion found an inconsistent state"),
+            })?;
         let mut batch = db.new_batch();
-        for (key, value) in self.expand(&Base::db(db)).await? {
+        for (key, value) in expanded {
             batch = batch.write(key, value.cloned());
         }
         batch.merkleize(db, self.metadata().cloned(), policy).await
@@ -536,7 +546,7 @@ impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
     async fn expand<F, E, C, V, I, H, const N: usize, S>(
         &self,
         base: &Base<'_, F, E, C, K, V, I, H, N, S>,
-    ) -> Result<BTreeMap<K, Option<&A>>, qmdb::Error<F>>
+    ) -> Result<BTreeMap<K, Option<&A>>, BuildError<F>>
     where
         F: Graftable,
         E: Context,

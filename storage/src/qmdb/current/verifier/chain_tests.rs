@@ -135,8 +135,9 @@ fn commitment<F: Graftable, V: ValueEncoding, S: Strategy>(
 
 /// Batches whose changes depend on a pending parent's: keys a parent created, deleted again
 /// singly and by a range; a range that deletes nothing, after a key a parent changed; a key a
-/// parent deleted, created again; an unbounded range whose least key a parent created; and
-/// emptying and refilling the state.
+/// parent deleted, created again; an unbounded range whose least key a parent created; emptying
+/// and refilling the state; and an unbounded range whose least key a parent created below the
+/// database's, which it deleted.
 fn chain_batches() -> Vec<Batch> {
     let mut fill = UserBatch::new();
     for i in 0..300 {
@@ -149,6 +150,13 @@ fn chain_batches() -> Vec<Batch> {
     let mut revive = UserBatch::new();
     revive.set(key(5), key(2));
     revive.delete_range(..key(3)).unwrap();
+    let mut refill = UserBatch::new();
+    for i in 10..20 {
+        refill.set(key(i), key(i));
+    }
+    let mut shift = UserBatch::new();
+    shift.delete(key(9));
+    shift.set(key(5), key(6));
     vec![
         fill,
         thin,
@@ -168,6 +176,11 @@ fn chain_batches() -> Vec<Batch> {
         UserBatch::from([UserOp::delete(key(7))]),
         UserBatch::new(),
         UserBatch::from([UserOp::set(key(9), key(5))]),
+        refill,
+        shift,
+        // The database's least key, which the parent deleted, follows the least key, which the
+        // parent created.
+        UserBatch::from([UserOp::delete_range(..key(12))]),
     ]
 }
 
