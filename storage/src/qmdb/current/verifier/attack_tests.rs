@@ -7,11 +7,11 @@ use super::{
     VerifyError,
     bitmap::{build_bitmap_proof, verify_bitmap},
     floor::check_policy,
+    opening::authenticate_pre_state,
     ordered::{
         PreparedOrderedBatch, authenticate_records, derive_ordered_transition,
         expand_range_deletes, merge_active_claims,
     },
-    opening::authenticate_pre_state,
 };
 use crate::{
     journal::contiguous::{Contiguous as _, fixed::Config as JournalConfig},
@@ -23,11 +23,11 @@ use crate::{
     },
     translator::OneCap,
 };
-use std::collections::BTreeSet;
 use commonware_cryptography::Sha256;
 use commonware_parallel::Sequential;
 use commonware_runtime::{Runner as _, buffer::paged::CacheRef, deterministic};
 use commonware_utils::{NZU16, NZU64, NZUsize, bitmap::Readable as _, sequence::FixedBytes};
+use std::collections::BTreeSet;
 
 type Key = FixedBytes<8>;
 type Commitment<F> = CurrentCommitment<F, Key, FixedEncoding<Key>, Sha256, 32>;
@@ -149,7 +149,13 @@ fn reject<F: Graftable>(
     post: Commitment<F>,
     expected: &[VerifyError],
 ) {
-    let result = batch.verify(pre, TrustedMap::empty_cache(pre), bundle, post, &mut Proportional);
+    let result = batch.verify(
+        pre,
+        TrustedMap::empty_cache(pre),
+        bundle,
+        post,
+        &mut Proportional,
+    );
     let Err(error) = result else {
         panic!("accepted {what}");
     };
@@ -173,7 +179,13 @@ fn stale_record_is_not_a_member<F: Graftable>() {
         let post =
             Commitment::<F>::from_parts(merkleized.bounds().tip.size, merkleized.root()).unwrap();
         batch
-            .verify(pre, TrustedMap::empty_cache(pre), &honest, post, &mut Proportional)
+            .verify(
+                pre,
+                TrustedMap::empty_cache(pre),
+                &honest,
+                post,
+                &mut Proportional,
+            )
             .unwrap();
 
         // The old record of key 8 at its real, now inactive, location, with a genuine shared
@@ -285,7 +297,13 @@ fn records_outside_the_live_range_are_rejected<F: Graftable>() {
         let post =
             Commitment::<F>::from_parts(merkleized.bounds().tip.size, merkleized.root()).unwrap();
         batch
-            .verify(pre, TrustedMap::empty_cache(pre), &honest, post, &mut Proportional)
+            .verify(
+                pre,
+                TrustedMap::empty_cache(pre),
+                &honest,
+                post,
+                &mut Proportional,
+            )
             .unwrap();
 
         let mut forged = honest.clone();
@@ -349,13 +367,22 @@ fn a_graftable_record_below_the_floor_is_not_a_member<F: Graftable>() {
         }
         let pre = commitment(&db);
         let old_chunk = *old_loc / 256;
-        assert!(*db.inactivity_floor_loc() >= 2 * 256, "the floor must pass the old chunk");
+        assert!(
+            *db.inactivity_floor_loc() >= 2 * 256,
+            "the floor must pass the old chunk"
+        );
         let batch = Batch::from([UserBatchOp::set_value(3, 301)]);
         let (honest, merkleized) = batch.prove(&db, &mut Proportional).await.unwrap();
         let post =
             Commitment::<F>::from_parts(merkleized.bounds().tip.size, merkleized.root()).unwrap();
         batch
-            .verify(pre, TrustedMap::empty_cache(pre), &honest, post, &mut Proportional)
+            .verify(
+                pre,
+                TrustedMap::empty_cache(pre),
+                &honest,
+                post,
+                &mut Proportional,
+            )
             .unwrap();
 
         let mut forged = honest.clone();
@@ -432,7 +459,13 @@ fn a_shortened_scan_is_rejected<F: Graftable>() {
         let post =
             Commitment::<F>::from_parts(merkleized.bounds().tip.size, merkleized.root()).unwrap();
         batch
-            .verify(pre, TrustedMap::empty_cache(pre), &honest, post, &mut Proportional)
+            .verify(
+                pre,
+                TrustedMap::empty_cache(pre),
+                &honest,
+                post,
+                &mut Proportional,
+            )
             .unwrap();
         let BitmapProof::Proven(bitmap) = &honest.bitmap else {
             panic!("expected a proven bitmap");
@@ -631,7 +664,9 @@ fn retained_facts_are_true<F: Graftable>() {
                             .get_with_loc(&entry.key)
                             .await
                             .unwrap()
-                            .unwrap_or_else(|| panic!("round {round}: {:?} is not active", entry.key));
+                            .unwrap_or_else(|| {
+                                panic!("round {round}: {:?} is not active", entry.key)
+                            });
                         if let KnownTrusted(cached) = entry.location {
                             assert_eq!(cached, location, "round {round}: {:?}", entry.key);
                         }
@@ -649,8 +684,13 @@ fn retained_facts_are_true<F: Graftable>() {
                             .get_with_loc(predecessor)
                             .await
                             .unwrap()
-                            .unwrap_or_else(|| panic!("round {round}: span start {predecessor:?} is not active"));
-                        assert_eq!(&record.next_key, successor, "round {round}: span from {predecessor:?}");
+                            .unwrap_or_else(|| {
+                                panic!("round {round}: span start {predecessor:?} is not active")
+                            });
+                        assert_eq!(
+                            &record.next_key, successor,
+                            "round {round}: span from {predecessor:?}"
+                        );
                     }
                     if partial.entries().next().is_some() {
                         assert!(!db.is_empty());
@@ -664,7 +704,10 @@ fn retained_facts_are_true<F: Graftable>() {
                 db = db.prune(boundary).await.unwrap();
             }
         }
-        assert!(entries_seen > 100 && spans_seen > 20, "{entries_seen} entries, {spans_seen} spans");
+        assert!(
+            entries_seen > 100 && spans_seen > 20,
+            "{entries_seen} entries, {spans_seen} spans"
+        );
         db.destroy().await.unwrap();
     });
 }

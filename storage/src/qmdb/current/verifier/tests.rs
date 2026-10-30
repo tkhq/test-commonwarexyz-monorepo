@@ -301,7 +301,9 @@ fn reject_forgeries<F: Graftable, P: Policy<F, Key, Key> + Clone + Debug>(
         let mut forged = proof.clone();
         forged.pre_state_claims.retain(|claim| match claim {
             PreStateKeyClaim::Member(member) => member.next_key > member.key,
-            PreStateKeyClaim::Exclusion(exclusion) => exclusion.owner.next_key > exclusion.owner.key,
+            PreStateKeyClaim::Exclusion(exclusion) => {
+                exclusion.owner.next_key > exclusion.owner.key
+            }
         });
         rejects(
             "a missing wrapping record",
@@ -415,13 +417,17 @@ fn reject_forgeries<F: Graftable, P: Policy<F, Key, Key> + Clone + Debug>(
         units.insert(0, units[0].clone())
     });
     // A chunk past the last one is out of place; a graftable one must also carry its raw digest.
-    forge("an extra bitmap unit", &[Bitmap(B::Coverage), Bitmap(B::RawDigest)], &|units| {
-        let mut extra = units[units.len() - 1].clone();
-        if let BitmapUnit::ExplicitChunk { chunk_index, .. } = &mut extra {
-            *chunk_index += 1;
-        }
-        units.push(extra);
-    });
+    forge(
+        "an extra bitmap unit",
+        &[Bitmap(B::Coverage), Bitmap(B::RawDigest)],
+        &|units| {
+            let mut extra = units[units.len() - 1].clone();
+            if let BitmapUnit::ExplicitChunk { chunk_index, .. } = &mut extra {
+                *chunk_index += 1;
+            }
+            units.push(extra);
+        },
+    );
     if units.len() > 1 {
         forge("reordered bitmap units", &coverage, &|units| {
             units.swap(0, 1)

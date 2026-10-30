@@ -319,8 +319,7 @@ where
     let points = expand_range_deletes(&cache, batch.ops())?;
     let prepared = derive_ordered_transition(&cache, &points)?;
     check_bitmap_coverage(&pre, &prepared, &claimed, &bitmap)?;
-    let candidates =
-        verify_candidates(&pre, &bitmap, &proof_bundle.pre_state_candidates)?;
+    let candidates = verify_candidates(&pre, &bitmap, &proof_bundle.pre_state_candidates)?;
     let floor = advance_floor(
         &pre,
         &prepared,

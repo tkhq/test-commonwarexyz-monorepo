@@ -107,12 +107,18 @@ fn proves_transitions_at_an_old_checkpoint<F: Graftable>() {
             db = apply(db, &round_batch(round)).await;
         }
         let db = db.commit().await.unwrap();
-        assert!(db.inactivity_floor_loc() > old_size, "the floor passed the checkpoint");
+        assert!(
+            db.inactivity_floor_loc() > old_size,
+            "the floor passed the checkpoint"
+        );
 
         // The checkpoint's commit, proved against the old size, gives its ops root and floor,
         // and the floor gives the lowest location a sync to that size may need.
         let last = old_size - 1;
-        let (proof, ops) = db.ops_historical_proof(old_size, last, NZU64!(1)).await.unwrap();
+        let (proof, ops) = db
+            .ops_historical_proof(old_size, last, NZU64!(1))
+            .await
+            .unwrap();
         let encoded = ops.iter().map(|op| op.encode()).collect::<Vec<_>>();
         let ops_root = proof
             .reconstruct_root(&qmdb::hasher::<Sha256>(), &encoded, last)
@@ -121,7 +127,8 @@ fn proves_transitions_at_an_old_checkpoint<F: Graftable>() {
         let [Operation::CommitFloor(_, old_floor)] = ops.as_slice() else {
             panic!("a checkpoint ends with its commit");
         };
-        let start = sync_boundary::<F, CHUNK_BYTES>(**old_floor / (8 * CHUNK_BYTES as u64), *old_size);
+        let start =
+            sync_boundary::<F, CHUNK_BYTES>(**old_floor / (8 * CHUNK_BYTES as u64), *old_size);
         assert_eq!(start, old_boundary);
 
         let live = Arc::new(db);
@@ -148,7 +155,13 @@ fn proves_transitions_at_an_old_checkpoint<F: Graftable>() {
             assert_eq!(&commitment(&copy), pre);
             let (bundle, merkleized) = batch.prove(&copy, &mut Proportional).await.unwrap();
             let verified = batch
-                .verify(*pre, TrustedMap::empty_cache(*pre), &bundle, *post, &mut Proportional)
+                .verify(
+                    *pre,
+                    TrustedMap::empty_cache(*pre),
+                    &bundle,
+                    *post,
+                    &mut Proportional,
+                )
                 .unwrap();
             assert_eq!(verified.commitment(), post);
             copy = copy.apply_batch(merkleized).await.unwrap();

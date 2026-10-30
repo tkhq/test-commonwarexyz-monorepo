@@ -128,15 +128,9 @@ impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
             .collect::<BTreeMap<_, _>>();
         #[cfg(feature = "prover-self-check")]
         let mut check = replay.clone();
-        let walked = build_candidate_proof(
-            db,
-            &prepared,
-            &known,
-            commitment.size(),
-            old_floor,
-            replay,
-        )
-        .await?;
+        let walked =
+            build_candidate_proof(db, &prepared, &known, commitment.size(), old_floor, replay)
+                .await?;
         // One raw multi-proof covers every record the claims and candidates carry.
         let claimed = pre_state_claims
             .iter()
@@ -146,7 +140,13 @@ impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
             })
             .collect::<BTreeSet<_>>();
         let mut records = claimed.clone();
-        records.extend(walked.proof.operations.iter().map(|(location, _)| *location));
+        records.extend(
+            walked
+                .proof
+                .operations
+                .iter()
+                .map(|(location, _)| *location),
+        );
         let records = records.into_iter().collect::<Vec<_>>();
         let records_proof = if records.is_empty() {
             None
@@ -322,42 +322,42 @@ impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
         // Settle the keys the batch did not reveal. An absent key's span owner comes from the
         // index; an empty pre-state has none and needs no claim.
         let claims = try_join_all(requests.into_iter().map(|(key, request)| async move {
-                let request = match request {
-                    Request::Unknown => match db.any.get_with_loc(&key).await? {
-                        Some((update, location)) => Request::Member((location, update)),
-                        None => Request::Absent,
-                    },
-                    request => request,
-                };
-                let request = match request {
-                    Request::Absent => match db.any.get_span(&key).await? {
-                        Some(owner) => Request::Excluded(owner),
-                        None => return Ok(None),
-                    },
-                    request => request,
-                };
-                Ok::<_, BuildError<F>>(Some(match request {
-                    Request::Member((location, update)) => {
-                        PreStateKeyClaim::Member(PreStateMemberClaim {
-                            location,
-                            key,
-                            value: update.value,
-                            next_key: update.next_key,
-                        })
-                    }
-                    Request::Excluded((location, owner)) => {
-                        PreStateKeyClaim::Exclusion(PreStateExclusionClaim {
-                            queried_key: key,
-                            location,
-                            owner,
-                        })
-                    }
-                    Request::Absent | Request::Unknown => {
-                        return Err(BuildError::InvalidState("an absent key was not resolved"));
-                    }
-                }))
+            let request = match request {
+                Request::Unknown => match db.any.get_with_loc(&key).await? {
+                    Some((update, location)) => Request::Member((location, update)),
+                    None => Request::Absent,
+                },
+                request => request,
+            };
+            let request = match request {
+                Request::Absent => match db.any.get_span(&key).await? {
+                    Some(owner) => Request::Excluded(owner),
+                    None => return Ok(None),
+                },
+                request => request,
+            };
+            Ok::<_, BuildError<F>>(Some(match request {
+                Request::Member((location, update)) => {
+                    PreStateKeyClaim::Member(PreStateMemberClaim {
+                        location,
+                        key,
+                        value: update.value,
+                        next_key: update.next_key,
+                    })
+                }
+                Request::Excluded((location, owner)) => {
+                    PreStateKeyClaim::Exclusion(PreStateExclusionClaim {
+                        queried_key: key,
+                        location,
+                        owner,
+                    })
+                }
+                Request::Absent | Request::Unknown => {
+                    return Err(BuildError::InvalidState("an absent key was not resolved"));
+                }
             }))
-            .await?;
+        }))
+        .await?;
         Ok(claims.into_iter().flatten().collect())
     }
 
@@ -762,25 +762,23 @@ where
     // Read that ordered location list concurrently; every surviving bit must still resolve to
     // an update. Verification later authenticates all payloads.
     let mut operations = try_join_all(locations.iter().copied().map(|location| async move {
-            let operation = match known.get(&location) {
-                Some(&update) => Operation::Update(update.clone()),
-                None => db
-                    .any
-                    .log
-                    .read(location.as_u64())
-                    .await
-                    .map_err(qmdb::Error::Journal)?,
-            };
-            if !prepared.superseded.contains(&location)
-                && !matches!(operation, Operation::Update(_))
-            {
-                return Err(BuildError::InvalidState(
-                    "a non-terminal active bitmap bit references a non-update operation",
-                ));
-            }
-            Ok((location, operation))
-        }))
-        .await?;
+        let operation = match known.get(&location) {
+            Some(&update) => Operation::Update(update.clone()),
+            None => db
+                .any
+                .log
+                .read(location.as_u64())
+                .await
+                .map_err(qmdb::Error::Journal)?,
+        };
+        if !prepared.superseded.contains(&location) && !matches!(operation, Operation::Update(_)) {
+            return Err(BuildError::InvalidState(
+                "a non-terminal active bitmap bit references a non-update operation",
+            ));
+        }
+        Ok((location, operation))
+    }))
+    .await?;
 
     let updates = operations
         .iter()
