@@ -7,7 +7,7 @@ use super::prover::{Timed, bench_all};
 use criterion::{Criterion, criterion_group};
 
 fn bench_step(c: &mut Criterion) {
-    bench_all(c, module_path!(), Timed::Step);
+    bench_all(c, module_path!(), Timed::Step, &[0]);
 }
 
 criterion_group! {

@@ -33,13 +33,15 @@ fn bench_family<F: Graftable, S: Strategy>(
                     let (batch, pre, proof, post) = fixture.get_or_insert_with(|| {
                         let strategy = strategy.clone();
                         tokio::Runner::default().start(|context| async move {
-                            let Fixture { database, batch, pre, proof, post } = prepare::<F, _, _>(
+                            let Fixture { database, batch, pre, proof, post, .. } = prepare::<F, _, _>(
                                 context,
                                 key_count,
                                 action_count,
                                 seed,
                                 "stateless-verifier-bench",
                                 strategy,
+                                0,
+                                false,
                             )
                             .await;
                             database.destroy().await.unwrap();
