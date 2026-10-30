@@ -5,6 +5,7 @@ use super::{
     BitmapFault, BitmapProof, CandidateFault, CurrentCommitment, PreStateCandidateProof,
     PreStateExclusionClaim, PreStateKeyClaim, PreStateMemberClaim, TrustedMap, UserBatch,
     VerifyError,
+    base::Base,
     bitmap::{build_bitmap_proof, verify_bitmap},
     floor::check_policy,
     opening::authenticate_pre_state,
@@ -720,4 +721,143 @@ fn mmr_retained_facts_are_true() {
 #[test]
 fn mmb_retained_facts_are_true() {
     retained_facts_are_true::<mmb::Family>();
+}
+
+/// A record the database still holds active, but a pending parent superseded, is stale in the
+/// state after the parent: with a genuine inclusion proof against that state, it establishes
+/// neither membership nor an edge.
+fn record_a_pending_parent_superseded_is_not_a_member<F: Graftable>() {
+    let executor = deterministic::Runner::default();
+    executor.start(|context| async move {
+        let db = open::<F>(context).await;
+        let db = apply(db, &Batch::from_iter((1..=8).map(UserBatchOp::set))).await;
+        let (old, old_loc) = db.any.get_with_loc(&key(8)).await.unwrap().unwrap();
+        let rewrite = Batch::from([UserBatchOp::set_value(8, 300)]);
+        let (_, parent) = rewrite.prove(&db, &mut Proportional).await.unwrap();
+        let pre = Commitment::<F>::from_parts(parent.bounds().tip.size, parent.root()).unwrap();
+        let base = Base::chain(&db, &parent).unwrap();
+        // The database still holds the old record active.
+        assert_eq!(
+            db.any
+                .get_with_loc(&key(8))
+                .await
+                .unwrap()
+                .map(|(_, loc)| loc),
+            Some(old_loc)
+        );
+
+        let batch = Batch::from([UserBatchOp::set_value(8, 301)]);
+        let (honest, child) = batch
+            .prove_on(&parent, &db, &mut Proportional)
+            .await
+            .unwrap();
+        let post = Commitment::<F>::from_parts(child.bounds().tip.size, child.root()).unwrap();
+        batch
+            .verify(
+                pre,
+                TrustedMap::empty_cache(pre),
+                &honest,
+                post,
+                &mut Proportional,
+            )
+            .unwrap();
+        let reprove = async |bundle: &mut Bundle<F>| {
+            let mut locations = claimed(&bundle.pre_state_claims);
+            locations.extend(
+                bundle
+                    .pre_state_candidates
+                    .operations
+                    .iter()
+                    .map(|(location, _)| *location),
+            );
+            let locations = locations.into_iter().collect::<Vec<_>>();
+            let inactive = F::inactive_peaks(bundle.claims.pre_size, bundle.claims.pre_floor);
+            bundle.records_proof = Some(base.records_proof(inactive, &locations).await.unwrap());
+        };
+
+        let mut forged = honest.clone();
+        forged.pre_state_claims = vec![PreStateKeyClaim::Member(PreStateMemberClaim {
+            location: old_loc,
+            key: key(8),
+            value: key(8),
+            next_key: old.next_key.clone(),
+        })];
+        reprove(&mut forged).await;
+        reject(
+            "a record the parent superseded as a member",
+            &batch,
+            pre,
+            &forged,
+            post,
+            &[
+                VerifyError::InvalidBitmapProof(BitmapFault::Coverage),
+                VerifyError::InvalidBitmapProof(BitmapFault::NeedsBytes),
+                VerifyError::InvalidBitmapProof(BitmapFault::Inactive),
+                VerifyError::InactiveClaim,
+            ],
+        );
+
+        // The stale record's edge, which wraps from the greatest key, as an exclusion for a
+        // greater absent key. Cover the claim's chunk so the bitmap proof itself passes.
+        let queried = {
+            let mut bytes = [0u8; 8];
+            bytes.copy_from_slice(key(8).as_ref());
+            bytes[7] = bytes[7].wrapping_add(1);
+            FixedBytes::new(bytes)
+        };
+        let deletes = Batch::from([super::UserOp::delete(queried.clone())]);
+        let (honest_delete, child) = deletes
+            .prove_on(&parent, &db, &mut Proportional)
+            .await
+            .unwrap();
+        let post_delete =
+            Commitment::<F>::from_parts(child.bounds().tip.size, child.root()).unwrap();
+        let mut forged = honest_delete.clone();
+        forged.pre_state_claims = vec![PreStateKeyClaim::Exclusion(PreStateExclusionClaim {
+            queried_key: queried,
+            location: old_loc,
+            owner: old,
+        })];
+        reprove(&mut forged).await;
+        let BitmapProof::Proven(bitmap) = &honest_delete.bitmap else {
+            panic!("expected a proven bitmap");
+        };
+        let unchanged = PreparedOrderedBatch {
+            application_ops: Vec::new(),
+            superseded: BTreeSet::new(),
+            deleted_keys: BTreeSet::new(),
+            post_empty: false,
+        };
+        forged.bitmap = base
+            .bitmap_proof(
+                pre.size(),
+                honest_delete.claims.pre_floor,
+                bitmap.floor_scan_end,
+                &unchanged,
+                &claimed(&forged.pre_state_claims),
+            )
+            .await
+            .unwrap();
+        reject(
+            "an edge the parent superseded as an exclusion",
+            &deletes,
+            pre,
+            &forged,
+            post_delete,
+            &[VerifyError::InactiveClaim],
+        );
+        drop(child);
+        drop(parent);
+        db.destroy().await.unwrap();
+    });
+}
+
+#[test]
+fn mmr_record_a_pending_parent_superseded_is_not_a_member() {
+    record_a_pending_parent_superseded_is_not_a_member::<mmr::Family>();
+}
+
+#[test]
+fn mmb_record_a_pending_parent_superseded_is_not_a_member() {
+    record_a_pending_parent_superseded_is_not_a_member::<mmb::Family>();
 }
