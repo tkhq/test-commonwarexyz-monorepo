@@ -1,10 +1,9 @@
 //! Proof production from a committed storage-backed ordered Current database.
 
 use super::{
-    BatchProofBundle, BuildError, ClaimedBatchBounds, CurrentCommitment, PreStateCandidateProof,
-    PreStateExclusionClaim, PreStateKeyClaim, PreStateMemberClaim, PreStateOpeningClaim,
-    PreStateTerminalClaim, UserBatch, UserOp, VerifyError,
-    bitmap::build_bitmap_proof,
+    BatchProofBundle, BuildError, ClaimedBatchBounds, PreStateCandidateProof,
+    PreStateExclusionClaim, PreStateKeyClaim, PreStateMemberClaim, UserBatch, UserOp, VerifyError,
+    base::Base,
     commitment::validate_profile,
     floor::{check_policy, walk_floor},
     ordered::PreparedOrderedBatch,
@@ -13,13 +12,13 @@ use super::{
 use crate::{
     Context,
     index::Ordered as OrderedIndex,
-    journal::contiguous::{Contiguous as _, Mutable},
-    merkle::{self, Graftable, Location},
+    journal::contiguous::Mutable,
+    merkle::{Graftable, Location},
     qmdb::{
         self,
         any::{
             ValueEncoding,
-            batch::DiffEntry,
+            batch::{DiffCursors, DiffEntry},
             operation::{Operation, update},
         },
         current::{batch::MerkleizedBatch, ordered},
@@ -30,8 +29,8 @@ use crate::{
 use commonware_codec::Codec;
 use commonware_cryptography::Hasher;
 use commonware_parallel::Strategy;
-use commonware_utils::{NZU64, bitmap::Readable as _, futures::try_join_all};
-use futures::{StreamExt as _, pin_mut, try_join};
+use commonware_utils::futures::try_join_all;
+use futures::try_join;
 use std::{
     collections::{BTreeMap, BTreeSet},
     ops::Bound,
@@ -44,6 +43,7 @@ type ExactRecord<F, K, V> = (Location<F>, OrderedUpdate<K, V>);
 impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
     /// Merkleize this batch through the ordinary database writer and build its proof bundle
     /// from the merkleized batch, against this database's current committed checkpoint.
+    /// [`prove_on`](Self::prove_on) does the same on top of a pending batch.
     ///
     /// The bundle works with an empty trusted cache. Member and exclusion claims cover the
     /// requested keys, every member of a delete range, and affected predecessors. A range
@@ -100,8 +100,85 @@ impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
         P: Policy<F, K, A> + Clone + Send,
         Operation<F, OrderedUpdate<K, V>>: Codec,
     {
+        self.prove_from(Base::db(db), policy).await
+    }
+
+    /// [`prove`](Self::prove) on top of `parent`, a pending batch `db` created: the proof
+    /// starts from the state after `parent`, whether or not `parent` is applied.
+    ///
+    /// The bundle and the returned batch are the ones [`prove`](Self::prove) gives once
+    /// `db` has applied `parent`. The returned batch is a child of `parent`, so the next
+    /// batch can be proved on top of it in turn. Reads consult the chain's changes, newest
+    /// first, before the database, as a batch's own reads do (see [`crate::qmdb::chain`]).
+    ///
+    /// Every unapplied batch in the chain must still be held, as for merkleizing a child.
+    /// Fails with [`crate::qmdb::Error::StaleRead`] unless `db` is at a state of `parent`'s
+    /// chain, for example after a sibling of a batch in it was applied, and with an error
+    /// if an unapplied ancestor was dropped.
+    ///
+    /// # Complexity
+    ///
+    /// As for [`prove`](Self::prove), plus the cost of reading through the chain. Let `j` be
+    /// the number of batches a read consults, the pending ones and any applied ones still
+    /// held, with diffs of up to `d_j` keys, of which up to `x_j` are deletions. A key's
+    /// record costs a binary search in each, O(j * log(d_j + 2)), before the database's
+    /// lookup. A span owner or predecessor also scans past deletions in each batch to its
+    /// nearest live entry, and finds that entry's operation from the newest batch down:
+    /// O(j * (log(d_j + 2) + x_j) + j^2). A range enumeration merges the batches' changes in
+    /// the range, and finding the least key merges all of them.
+    #[allow(clippy::type_complexity)]
+    pub async fn prove_on<F, E, C, V, I, H, P, const N: usize, S>(
+        &self,
+        parent: &Arc<MerkleizedBatch<F, H::Digest, OrderedUpdate<K, V>, N, S>>,
+        db: &ordered::db::Db<F, E, C, K, V, I, H, N, S>,
+        policy: &mut P,
+    ) -> Result<
+        (
+            BatchProofBundle<F, K, V, H, N>,
+            Arc<MerkleizedBatch<F, H::Digest, OrderedUpdate<K, V>, N, S>>,
+        ),
+        BuildError<F>,
+    >
+    where
+        F: Graftable,
+        E: Context,
+        C: Mutable<Item = Operation<F, OrderedUpdate<K, V>>>,
+        V: ValueEncoding<Value = A>,
+        I: OrderedIndex<Value = Location<F>> + 'static,
+        H: Hasher,
+        S: Strategy,
+        P: Policy<F, K, A> + Clone + Send,
+        Operation<F, OrderedUpdate<K, V>>: Codec,
+    {
+        self.prove_from(Base::chain(db, parent)?, policy).await
+    }
+
+    /// Prove this batch from `base`.
+    #[allow(clippy::type_complexity)]
+    async fn prove_from<F, E, C, V, I, H, P, const N: usize, S>(
+        &self,
+        base: Base<'_, F, E, C, K, V, I, H, N, S>,
+        policy: &mut P,
+    ) -> Result<
+        (
+            BatchProofBundle<F, K, V, H, N>,
+            Arc<MerkleizedBatch<F, H::Digest, OrderedUpdate<K, V>, N, S>>,
+        ),
+        BuildError<F>,
+    >
+    where
+        F: Graftable,
+        E: Context,
+        C: Mutable<Item = Operation<F, OrderedUpdate<K, V>>>,
+        V: ValueEncoding<Value = A>,
+        I: OrderedIndex<Value = Location<F>> + 'static,
+        H: Hasher,
+        S: Strategy,
+        P: Policy<F, K, A> + Clone + Send,
+        Operation<F, OrderedUpdate<K, V>>: Codec,
+    {
         validate_profile::<H, N>();
-        let commitment = CurrentCommitment::from_parts(db.bounds().end, db.root())?;
+        let commitment = base.commitment()?;
         if policy.evicts() {
             return Err(BuildError::UnsupportedFloorPolicy);
         }
@@ -109,21 +186,22 @@ impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
         // The opening reads only the pre-state, so it runs beside range expansion and the
         // writer.
         let merkleize = async {
-            let expanded = self.expand_from_db(db).await?;
-            let mut writer = db.new_batch();
+            let expanded = self.expand(&base).await?;
+            let mut writer = base.new_batch();
             for (key, value) in &expanded {
                 writer = writer.write(key.clone(), value.cloned());
             }
             let batch = writer
-                .merkleize(db, self.metadata().cloned(), policy)
+                .merkleize(base.db, self.metadata().cloned(), policy)
                 .await?;
             Ok::<_, BuildError<F>>((expanded, batch))
         };
         let ((expanded, batch), (pre_state, old_floor)) =
-            try_join!(merkleize, build_opening(db, commitment))?;
+            try_join!(merkleize, base.opening(commitment))?;
 
-        let old = read_old_records(db, &batch.inner.diff).await?;
-        let prepared = prepare_from_batch(&expanded, &batch, &old)?;
+        let pre_locations = pre_locations(&batch);
+        let old = read_old_records(&base, &batch.inner.diff, &pre_locations).await?;
+        let prepared = prepare_from_batch(&expanded, &batch, &pre_locations, &old)?;
         check_policy(&replay, prepared.made_inactive())
             .map_err(|_| BuildError::UnsupportedFloorPolicy)?;
 
@@ -136,8 +214,15 @@ impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
         // Claims and floor candidates both read the pre-state for the prepared batch, and
         // neither needs the other.
         let (pre_state_claims, walked) = try_join!(
-            self.claims(db, &expanded, &prepared, &old),
-            build_candidate_proof(db, &prepared, &known, commitment.size(), old_floor, replay,),
+            self.claims(&base, &expanded, &prepared, &old),
+            build_candidate_proof(
+                &base,
+                &prepared,
+                &known,
+                commitment.size(),
+                old_floor,
+                replay,
+            ),
         )?;
         let bounds = batch.bounds();
         if child_size(commitment.size(), &prepared, walked.copies)? != bounds.tip.size
@@ -169,26 +254,17 @@ impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
             if records.is_empty() {
                 return Ok(None);
             }
-            let proof = merkle::verification::multi_proof(
-                &db.any.log.merkle,
-                F::inactive_peaks(commitment.size(), old_floor),
-                &records,
-            )
-            .await?;
-            Ok::<_, BuildError<F>>(Some(proof))
+            let inactive_peaks = F::inactive_peaks(commitment.size(), old_floor);
+            Ok(Some(base.records_proof(inactive_peaks, &records).await?))
         };
-        let grafted = db.grafted_storage();
         let (records_proof, bitmap) = try_join!(
             records_proof,
-            build_bitmap_proof::<F, K, V, H, _, _, _, N>(
+            base.bitmap_proof(
                 commitment.size(),
                 old_floor,
                 walked.scan_end,
                 &prepared,
                 &claimed,
-                db.bitmap(),
-                &db.any.log.merkle,
-                &grafted,
             ),
         )?;
         let bundle = BatchProofBundle::new(
@@ -206,13 +282,13 @@ impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
         );
         #[cfg(feature = "prover-self-check")]
         {
-            let post = CurrentCommitment::from_parts(bounds.tip.size, batch.root())?;
+            let post = super::CurrentCommitment::from_parts(bounds.tip.size, batch.root())?;
             self.verify_with_strategy(
                 commitment,
                 super::TrustedMap::empty_cache(commitment),
                 &bundle,
                 post,
-                db.strategy(),
+                base.db.strategy(),
                 &mut check,
             )?;
         }
@@ -245,17 +321,46 @@ impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
             .map(|(bundle, _)| bundle)
     }
 
+    /// Construct a complete proof on top of `parent`, a pending batch `db` created.
+    ///
+    /// This is [`prove_on`](Self::prove_on) with a copy of `policy`, discarding the
+    /// merkleized batch, as [`build_batch_proof`](Self::build_batch_proof) is for
+    /// [`prove`](Self::prove).
+    #[allow(clippy::type_complexity)]
+    pub async fn build_batch_proof_on<F, E, C, V, I, H, P, const N: usize, S>(
+        &self,
+        parent: &Arc<MerkleizedBatch<F, H::Digest, OrderedUpdate<K, V>, N, S>>,
+        db: &ordered::db::Db<F, E, C, K, V, I, H, N, S>,
+        policy: &P,
+    ) -> Result<BatchProofBundle<F, K, V, H, N>, BuildError<F>>
+    where
+        F: Graftable,
+        E: Context,
+        C: Mutable<Item = Operation<F, OrderedUpdate<K, V>>>,
+        V: ValueEncoding<Value = A>,
+        I: OrderedIndex<Value = Location<F>> + 'static,
+        H: Hasher,
+        S: Strategy,
+        P: Policy<F, K, A> + Clone + Send,
+        Operation<F, OrderedUpdate<K, V>>: Codec,
+    {
+        self.prove_on(parent, db, &mut policy.clone())
+            .await
+            .map(|(bundle, _)| bundle)
+    }
+
     /// Build the pre-state key claims, in key order, from the batch's old records.
     ///
     /// Claims cover the mutated keys, each range's lower endpoint, the predecessor of every
     /// deleted key, and the greatest key when a range has no lower bound. A key with an old
     /// record is a member. An absent key's exclusion uses the old record whose successor link
     /// spans it: such a record is the key's pre-state span owner, since no pre-state key lies
-    /// inside a successor link. Keys the batch did not reveal fall back to the database index.
-    /// An empty pre-state needs no claims: its opening establishes that every key is absent.
+    /// inside a successor link. Keys the batch did not reveal fall back to the pre-state's
+    /// lookups. An empty pre-state needs no claims: its opening establishes that every key is
+    /// absent.
     async fn claims<F, E, C, V, I, H, const N: usize, S>(
         &self,
-        db: &ordered::db::Db<F, E, C, K, V, I, H, N, S>,
+        base: &Base<'_, F, E, C, K, V, I, H, N, S>,
         expanded: &BTreeMap<K, Option<&A>>,
         prepared: &PreparedOrderedBatch<F, K, V>,
         old: &[ExactRecord<F, K, V>],
@@ -312,37 +417,35 @@ impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
         for key in &prepared.deleted_keys {
             predecessors.push(match by_next.get(key) {
                 Some(&record) => record.clone(),
-                None => predecessor_record(db, key).await?,
+                None => base.predecessor(key).await?,
             });
         }
         // A range with no lower bound begins at the least key. Its predecessor is the
         // greatest key, whose successor link wraps to it.
-        if matches!(self.first().map(UserOp::start), Some(Bound::Unbounded)) {
-            let stream = db.keys(..);
-            pin_mut!(stream);
-            if let Some(first) = stream.next().await.transpose()? {
-                predecessors.push(match by_next.get(&first) {
-                    Some(&record) => record.clone(),
-                    None => predecessor_record(db, &first).await?,
-                });
-            }
+        if matches!(self.first().map(UserOp::start), Some(Bound::Unbounded))
+            && let Some(first) = base.first_key().await?
+        {
+            predecessors.push(match by_next.get(&first) {
+                Some(&record) => record.clone(),
+                None => base.predecessor(&first).await?,
+            });
         }
         for record in predecessors {
             requests.insert(record.1.key.clone(), Request::Member(record));
         }
 
         // Settle the keys the batch did not reveal. An absent key's span owner comes from the
-        // index; an empty pre-state has none and needs no claim.
+        // pre-state's lookups; an empty pre-state has none and needs no claim.
         let claims = try_join_all(requests.into_iter().map(|(key, request)| async move {
             let request = match request {
-                Request::Unknown => match db.any.get_with_loc(&key).await? {
-                    Some((update, location)) => Request::Member((location, update)),
-                    None => Request::Absent,
-                },
+                Request::Unknown => base
+                    .member(&key)
+                    .await?
+                    .map_or(Request::Absent, Request::Member),
                 request => request,
             };
             let request = match request {
-                Request::Absent => match db.any.get_span(&key).await? {
+                Request::Absent => match base.span_owner(&key).await? {
                     Some(owner) => Request::Excluded(owner),
                     None => return Ok(None),
                 },
@@ -416,7 +519,7 @@ impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
         Operation<F, OrderedUpdate<K, V>>: Codec,
     {
         let mut batch = db.new_batch();
-        for (key, value) in self.expand_from_db(db).await? {
+        for (key, value) in self.expand(&Base::db(db)).await? {
             batch = batch.write(key, value.cloned());
         }
         batch.merkleize(db, self.metadata().cloned(), policy).await
@@ -426,9 +529,9 @@ impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
     /// mutated key with the value a set writes or `None` for a delete. This is a storage
     /// lookup, not a proof: the verifier independently checks completeness by following
     /// authenticated successor links from each range's lower endpoint.
-    async fn expand_from_db<F, E, C, V, I, H, const N: usize, S>(
+    async fn expand<F, E, C, V, I, H, const N: usize, S>(
         &self,
-        db: &ordered::db::Db<F, E, C, K, V, I, H, N, S>,
+        base: &Base<'_, F, E, C, K, V, I, H, N, S>,
     ) -> Result<BTreeMap<K, Option<&A>>, qmdb::Error<F>>
     where
         F: Graftable,
@@ -450,10 +553,7 @@ impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
                     expanded.insert(key.clone(), None);
                 }
                 UserOp::DeleteRange { start, end } => {
-                    let stream = db.stream_range((start.clone(), end.clone()));
-                    pin_mut!(stream);
-                    while let Some(record) = stream.next().await {
-                        let (key, _) = record?;
+                    for key in base.keys_in((start.clone(), end.clone())).await? {
                         expanded.insert(key, None);
                     }
                 }
@@ -475,11 +575,47 @@ enum Request<F: Graftable, K: Key, V: ValueEncoding> {
     Unknown,
 }
 
-/// Read the pre-state record at every location `diff` records for a key, in the diff's key
-/// order: the records the batch supersedes and those its floor walk moves.
+/// Where each of `batch`'s diff keys has its record in the pre-state, in the diff's key order.
+///
+/// This is the location the writer clears for the key: the newest location a pending ancestor
+/// gave it, or, if no ancestor changed it, the database location the batch recorded. A key an
+/// ancestor deleted has none.
+fn pre_locations<F, K, V, D, const N: usize, S>(
+    batch: &MerkleizedBatch<F, D, OrderedUpdate<K, V>, N, S>,
+) -> Vec<Option<Location<F>>>
+where
+    F: Graftable,
+    K: Key,
+    V: ValueEncoding,
+    D: commonware_cryptography::Digest,
+    S: Strategy,
+{
+    let mut ancestors = DiffCursors::new(
+        batch
+            .inner
+            .ancestor_diffs
+            .iter()
+            .map(|diff| diff.as_slice()),
+    );
+    batch
+        .inner
+        .diff
+        .iter()
+        .map(|(key, entry)| {
+            ancestors
+                .resolve(key)
+                .map_or_else(|| entry.base_old_loc(), DiffEntry::loc)
+        })
+        .collect()
+}
+
+/// Read the pre-state record of every key `diff` holds one for, at its location in
+/// `pre_locations`, in the diff's key order: the records the batch supersedes and those its
+/// floor walk moves.
 async fn read_old_records<F, E, C, K, V, I, H, const N: usize, S>(
-    db: &ordered::db::Db<F, E, C, K, V, I, H, N, S>,
+    base: &Base<'_, F, E, C, K, V, I, H, N, S>,
     diff: &[(K, DiffEntry<F, V::Value>)],
+    pre_locations: &[Option<Location<F>>],
 ) -> Result<Vec<ExactRecord<F, K, V>>, BuildError<F>>
 where
     F: Graftable,
@@ -496,18 +632,12 @@ where
     // `Send` for callers that spawn it: a closure taking a reference has a higher-ranked type the
     // compiler cannot prove `Send` across the `await`.
     let mut reads = Vec::new();
-    for (key, entry) in diff {
-        let Some(location) = entry.base_old_loc() else {
+    for ((key, _), location) in diff.iter().zip(pre_locations) {
+        let Some(location) = *location else {
             continue;
         };
         reads.push(async move {
-            match db
-                .any
-                .log
-                .read(*location)
-                .await
-                .map_err(qmdb::Error::Journal)?
-            {
+            match base.read(location).await? {
                 Operation::Update(update) if update.key == *key => Ok((location, update)),
                 _ => Err(BuildError::InvalidState(
                     "a batch's base location does not hold its key's update",
@@ -524,10 +654,12 @@ where
 /// rewrites that keep successor links intact. Floor copies and the commit follow. A key the
 /// caller did not mutate is in the diff either as a rewritten predecessor, whose final
 /// successor differs from its old one, or as a record the floor walk moved unchanged. `old`
-/// holds the record at each entry's base location, in the diff's key order.
+/// holds the record at each entry's pre-state location in `pre_locations`, in the diff's key
+/// order.
 fn prepare_from_batch<F, K, V, D, const N: usize, S>(
     expanded: &BTreeMap<K, Option<&V::Value>>,
     batch: &MerkleizedBatch<F, D, OrderedUpdate<K, V>, N, S>,
+    pre_locations: &[Option<Location<F>>],
     old: &[ExactRecord<F, K, V>],
 ) -> Result<PreparedOrderedBatch<F, K, V>, BuildError<F>>
 where
@@ -543,8 +675,8 @@ where
     let mut superseded = BTreeSet::new();
     let mut deleted_keys = BTreeSet::new();
     let mut count = 0usize;
-    for (key, entry) in batch.inner.diff.iter() {
-        let record = entry.base_old_loc().and_then(|_| old.next());
+    for ((key, entry), location) in batch.inner.diff.iter().zip(pre_locations) {
+        let record = location.and_then(|_| old.next());
         match (expanded.get(key), entry, record) {
             (Some(None), DiffEntry::Deleted { .. }, Some((location, _))) => {
                 deleted_keys.insert(key.clone());
@@ -582,102 +714,6 @@ where
     })
 }
 
-/// Locate the immediate cyclic predecessor needed when deleting a member.
-/// The index groups keys by translated prefixes, so inspect both the member's bucket
-/// and the previous bucket (wrapping at the minimum), then match the exact successor.
-/// Its ordinary membership proof will authenticate this link for the recipient.
-/// For a bucket of at most `l` locations, O(i + l * log(l + 2)) CPU, O(l)
-/// temporary locations, and O(l) record reads; `i` is index-lookup work. Bounded
-/// occupancy gives O(i) typical work, while all `m` active keys can share a bucket.
-async fn predecessor_record<F, E, C, K, V, I, H, const N: usize, S>(
-    db: &ordered::db::Db<F, E, C, K, V, I, H, N, S>,
-    key: &K,
-) -> Result<ExactRecord<F, K, V>, BuildError<F>>
-where
-    F: Graftable,
-    E: Context,
-    C: Mutable<Item = Operation<F, OrderedUpdate<K, V>>>,
-    K: Key,
-    V: ValueEncoding,
-    I: OrderedIndex<Value = Location<F>>,
-    H: Hasher,
-    S: Strategy,
-    Operation<F, OrderedUpdate<K, V>>: Codec,
-{
-    let mut locations = db.any.snapshot.get(key).copied().collect::<Vec<_>>();
-    if let Some((iter, _)) = db.any.snapshot.prev_translated_key(key) {
-        locations.extend(iter.copied());
-    }
-    locations.sort();
-    locations.dedup();
-    for location in locations {
-        let operation = db
-            .any
-            .log
-            .read(*location)
-            .await
-            .map_err(qmdb::Error::Journal)?;
-        let Operation::Update(update) = operation else {
-            return Err(BuildError::InvalidState(
-                "the active ordered index referenced a non-update operation",
-            ));
-        };
-        if update.next_key == *key {
-            return Ok((location, update));
-        }
-    }
-    Err(BuildError::InvalidState(
-        "the active ordered cycle has no predecessor for a member",
-    ))
-}
-
-/// Obtain the terminal's raw inclusion proof and the frontier immediately before it.
-/// The root witness binds the raw log to Current's bitmap-aware commitment. Together
-/// these let the verifier authenticate the old floor and reconstruct the append tip.
-async fn build_opening<F, E, C, K, V, I, H, const N: usize, S>(
-    db: &ordered::db::Db<F, E, C, K, V, I, H, N, S>,
-    commitment: CurrentCommitment<F, K, V, H, N>,
-) -> Result<(PreStateOpeningClaim<F, V, H::Digest, N>, Location<F>), BuildError<F>>
-where
-    F: Graftable,
-    E: Context,
-    C: Mutable<Item = Operation<F, OrderedUpdate<K, V>>>,
-    K: Key,
-    V: ValueEncoding,
-    I: OrderedIndex<Value = Location<F>>,
-    H: Hasher,
-    S: Strategy,
-    Operation<F, OrderedUpdate<K, V>>: Codec,
-{
-    if commitment.size() == Location::new(1) {
-        return Ok((PreStateOpeningClaim::Initial, Location::new(0)));
-    }
-    let terminal_location = commitment.size() - 1;
-    let (raw_proof, mut operations) = db
-        .ops_historical_proof(commitment.size(), terminal_location, NZU64!(1))
-        .await?;
-    let Some(Operation::CommitFloor(metadata, floor)) = operations.pop() else {
-        return Err(BuildError::InvalidState(
-            "the committed operation log does not end in CommitFloor",
-        ));
-    };
-    let witness = db.ops_root_witness().await?;
-    let pins_before_terminal = db.pinned_nodes_at(terminal_location).await?;
-    Ok((
-        PreStateOpeningClaim::Proven {
-            ops_root: db.ops_root(),
-            witness,
-            terminal: PreStateTerminalClaim {
-                metadata,
-                floor,
-                raw_proof,
-                pins_before_terminal,
-            },
-        },
-        floor,
-    ))
-}
-
 /// The child's size: the application operations, the floor walk's `copies`, and the terminal
 /// commit appended to the pre-state's `base_size` operations.
 fn child_size<F: Graftable, K: Key, V: ValueEncoding>(
@@ -712,7 +748,7 @@ struct CandidateEvidence<F: Graftable, K: Key, V: ValueEncoding> {
 /// copies must continue into the application suffix. The bundle's shared raw multi-proof
 /// authenticates these payloads; the bitmap proof separately establishes their completeness.
 async fn build_candidate_proof<F, E, C, K, V, I, H, P, const N: usize, S>(
-    db: &ordered::db::Db<F, E, C, K, V, I, H, N, S>,
+    base: &Base<'_, F, E, C, K, V, I, H, N, S>,
     prepared: &PreparedOrderedBatch<F, K, V>,
     known: &BTreeMap<Location<F>, &OrderedUpdate<K, V>>,
     pre_size: Location<F>,
@@ -745,43 +781,16 @@ where
 
     // Read ahead as many live records as the policy's entries allow, then let the walk itself
     // say where it ends: a policy may stop early, so the read-ahead can exceed the scan.
-    let terminal_location = pre_size - 1;
     let entries =
         u64::try_from(policy.limits(prepared.made_inactive()).entries).unwrap_or(u64::MAX);
-    let mut locations = Vec::new();
-    let mut live = 0u64;
-    if entries > 0 {
-        for raw_location in db
-            .bitmap()
-            .ones_iter_from(old_floor.as_u64())
-            .take_while(|location| *location < pre_size.as_u64())
-        {
-            let location = Location::new(raw_location);
-            if location == terminal_location {
-                continue;
-            }
-            locations.push(location);
-            if prepared.superseded.contains(&location) {
-                continue;
-            }
-            live += 1;
-            if live == entries {
-                break;
-            }
-        }
-    }
+    let locations = base.candidate_locations(old_floor, pre_size, &prepared.superseded, entries);
 
     // Read that ordered location list concurrently; every surviving bit must still resolve to
     // an update. Verification later authenticates all payloads.
     let mut operations = try_join_all(locations.iter().copied().map(|location| async move {
         let operation = match known.get(&location) {
             Some(&update) => Operation::Update(update.clone()),
-            None => db
-                .any
-                .log
-                .read(location.as_u64())
-                .await
-                .map_err(qmdb::Error::Journal)?,
+            None => base.read(location).await?,
         };
         if !prepared.superseded.contains(&location) && !matches!(operation, Operation::Update(_)) {
             return Err(BuildError::InvalidState(
