@@ -7,8 +7,11 @@
 //! proves a different batch, since it follows the batches below it in the seeded workload, so
 //! compare the two at one depth, not depths with each other or with [`super::step`]. The
 //! workload's range deletions remove most keys within a few batches, so under deep chains the
-//! database holds many keys the chain deleted, which the `pending` cases' range reads scan and
-//! discard. Setup matches [`super::prover`].
+//! database holds many keys the chain deleted.
+//!
+//! The `merkleize` and `bundle` cases split a `pending` case in two, as
+//! `UserBatch::merkleize_provable_on` and `ProvableBatch::bundle` do: a chain advances at the
+//! `merkleize` case's speed when bundles are built beside it. Setup matches [`super::prover`].
 
 use super::prover::{Timed, bench_all};
 use criterion::{Criterion, criterion_group};
@@ -34,8 +37,26 @@ fn bench_applied(c: &mut Criterion) {
     );
 }
 
+fn bench_merkleize(c: &mut Criterion) {
+    bench_all(
+        c,
+        &format!("{}::merkleize", module_path!()),
+        Timed::SplitMerkleize,
+        &DEPTHS,
+    );
+}
+
+fn bench_bundle(c: &mut Criterion) {
+    bench_all(
+        c,
+        &format!("{}::bundle", module_path!()),
+        Timed::SplitBundle,
+        &DEPTHS,
+    );
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default().sample_size(10);
-    targets = bench_pending, bench_applied
+    targets = bench_pending, bench_applied, bench_merkleize, bench_bundle
 }

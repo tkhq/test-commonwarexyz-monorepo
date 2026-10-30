@@ -1,8 +1,9 @@
 //! Proof production from a committed storage-backed ordered Current database.
 
 use super::{
-    BatchProofBundle, BuildError, ClaimedBatchBounds, PreStateCandidateProof,
-    PreStateExclusionClaim, PreStateKeyClaim, PreStateMemberClaim, UserBatch, UserOp, VerifyError,
+    BatchProofBundle, BuildError, ClaimedBatchBounds, CurrentCommitment, PreStateCandidateProof,
+    PreStateExclusionClaim, PreStateKeyClaim, PreStateMemberClaim, PreStateOpeningClaim, UserBatch,
+    UserOp, VerifyError,
     base::Base,
     commitment::validate_profile,
     floor::{check_policy, walk_floor},
@@ -39,6 +40,8 @@ use std::{
 
 type OrderedUpdate<K, V> = update::Ordered<K, V>;
 type ExactRecord<F, K, V> = (Location<F>, OrderedUpdate<K, V>);
+type Pending<F, K, V, H, const N: usize, S> =
+    Arc<MerkleizedBatch<F, <H as Hasher>::Digest, OrderedUpdate<K, V>, N, S>>;
 
 impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
     /// Merkleize this batch through the ordinary database writer and build its proof bundle
@@ -155,6 +158,74 @@ impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
         self.prove_from(Base::chain(db, parent)?, policy).await
     }
 
+    /// [`prove`](Self::prove) in two steps: merkleize this batch now, and build its bundle
+    /// later with [`ProvableBatch::bundle`].
+    ///
+    /// The returned value holds the merkleized batch, which the next batch can be built on
+    /// at once, for example with [`merkleize_provable_on`](Self::merkleize_provable_on), while
+    /// this batch's bundle is built elsewhere. It owns this batch and holds no borrow, so it
+    /// can move to another task. The bundle and batch are the ones `prove` returns.
+    ///
+    /// `policy` advances as `prove` advances it. An evicting policy fails with
+    /// [`BuildError::UnsupportedFloorPolicy`] before the batch is merkleized.
+    ///
+    /// # Complexity
+    ///
+    /// That of [`merkleize`](Self::merkleize). [`ProvableBatch::bundle`] takes the rest of
+    /// what [`prove`](Self::prove) takes.
+    #[allow(clippy::type_complexity)]
+    pub async fn merkleize_provable<F, E, C, V, I, H, P, const N: usize, S>(
+        self,
+        db: &ordered::db::Db<F, E, C, K, V, I, H, N, S>,
+        policy: &mut P,
+    ) -> Result<ProvableBatch<F, K, V, H, P, N, S>, BuildError<F>>
+    where
+        F: Graftable,
+        E: Context,
+        C: Mutable<Item = Operation<F, OrderedUpdate<K, V>>>,
+        V: ValueEncoding<Value = A>,
+        I: OrderedIndex<Value = Location<F>> + 'static,
+        H: Hasher,
+        S: Strategy,
+        P: Policy<F, K, A> + Clone + Send,
+        Operation<F, OrderedUpdate<K, V>>: Codec,
+    {
+        self.provable_from(Base::db(db), None, policy).await
+    }
+
+    /// [`merkleize_provable`](Self::merkleize_provable) on top of `parent`, a pending batch
+    /// `db` created, as [`prove_on`](Self::prove_on) is [`prove`](Self::prove) on top of it.
+    ///
+    /// The returned value holds `parent`. Every other unapplied batch in the chain must still
+    /// be held when the bundle is built, as for `prove_on`.
+    ///
+    /// # Complexity
+    ///
+    /// That of [`merkleize`](Self::merkleize), with range reads through the chain as for
+    /// [`prove_on`](Self::prove_on).
+    #[allow(clippy::type_complexity)]
+    pub async fn merkleize_provable_on<F, E, C, V, I, H, P, const N: usize, S>(
+        self,
+        parent: &Arc<MerkleizedBatch<F, H::Digest, OrderedUpdate<K, V>, N, S>>,
+        db: &ordered::db::Db<F, E, C, K, V, I, H, N, S>,
+        policy: &mut P,
+    ) -> Result<ProvableBatch<F, K, V, H, P, N, S>, BuildError<F>>
+    where
+        F: Graftable,
+        E: Context,
+        C: Mutable<Item = Operation<F, OrderedUpdate<K, V>>>,
+        V: ValueEncoding<Value = A>,
+        I: OrderedIndex<Value = Location<F>> + 'static,
+        H: Hasher,
+        S: Strategy,
+        P: Policy<F, K, A> + Clone + Send,
+        Operation<F, OrderedUpdate<K, V>>: Codec,
+    {
+        let base = Base::chain(db, parent)?;
+        self.provable_from(base, Some(Arc::clone(parent)), policy)
+            .await
+    }
+
     /// Prove this batch from `base`.
     #[allow(clippy::type_complexity)]
     async fn prove_from<F, E, C, V, I, H, P, const N: usize, S>(
@@ -187,23 +258,73 @@ impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
         let replay = policy.clone();
         // The opening reads only the pre-state, so it runs beside range expansion and the
         // writer.
-        let merkleize = async {
-            let expanded = self.expand(&base).await?;
-            let mut writer = base.new_batch();
-            for (key, value) in &expanded {
-                writer = writer.write(key.clone(), value.cloned());
-            }
-            let batch = writer
-                .merkleize(base.db, self.metadata().cloned(), policy)
-                .await?;
-            Ok::<_, BuildError<F>>((expanded, batch))
-        };
-        let ((expanded, batch), (pre_state, old_floor)) =
-            try_join!(merkleize, base.opening(commitment))?;
+        let ((mutated, batch), opening) =
+            try_join!(self.merkleize_from(&base, policy), base.opening(commitment))?;
+        let bundle = self
+            .bundle_from(&base, commitment, opening, &mutated, &batch, replay)
+            .await?;
+        Ok((bundle, batch))
+    }
 
-        let pre_locations = pre_locations(&batch);
-        let old = read_old_records(&base, &batch.inner.diff, &pre_locations).await?;
-        let prepared = prepare_from_batch(&expanded, &batch, &pre_locations, &old)?;
+    /// Merkleize this batch from `base`, keeping what building its bundle needs.
+    async fn provable_from<F, E, C, V, I, H, P, const N: usize, S>(
+        self,
+        base: Base<'_, F, E, C, K, V, I, H, N, S>,
+        parent: Option<Pending<F, K, V, H, N, S>>,
+        policy: &mut P,
+    ) -> Result<ProvableBatch<F, K, V, H, P, N, S>, BuildError<F>>
+    where
+        F: Graftable,
+        E: Context,
+        C: Mutable<Item = Operation<F, OrderedUpdate<K, V>>>,
+        V: ValueEncoding<Value = A>,
+        I: OrderedIndex<Value = Location<F>> + 'static,
+        H: Hasher,
+        S: Strategy,
+        P: Policy<F, K, A> + Clone + Send,
+        Operation<F, OrderedUpdate<K, V>>: Codec,
+    {
+        validate_profile::<H, N>();
+        if policy.evicts() {
+            return Err(BuildError::UnsupportedFloorPolicy);
+        }
+        let replay = policy.clone();
+        let (mutated, batch) = self.merkleize_from(&base, policy).await?;
+        Ok(ProvableBatch {
+            user: self,
+            parent,
+            mutated,
+            batch,
+            replay,
+        })
+    }
+
+    /// Build the bundle for `batch`, which the writer merkleized from `base` for `mutated`
+    /// with `replay` as its policy before the batch. `opening` is `base`'s opening, at
+    /// `commitment`, and its inactivity floor.
+    async fn bundle_from<F, E, C, V, I, H, P, const N: usize, S>(
+        &self,
+        base: &Base<'_, F, E, C, K, V, I, H, N, S>,
+        commitment: CurrentCommitment<F, K, V, H, N>,
+        (pre_state, old_floor): (PreStateOpeningClaim<F, V, H::Digest, N>, Location<F>),
+        mutated: &BTreeMap<K, bool>,
+        batch: &MerkleizedBatch<F, H::Digest, OrderedUpdate<K, V>, N, S>,
+        replay: P,
+    ) -> Result<BatchProofBundle<F, K, V, H, N>, BuildError<F>>
+    where
+        F: Graftable,
+        E: Context,
+        C: Mutable<Item = Operation<F, OrderedUpdate<K, V>>>,
+        V: ValueEncoding<Value = A>,
+        I: OrderedIndex<Value = Location<F>>,
+        H: Hasher,
+        S: Strategy,
+        P: Policy<F, K, A> + Clone + Send,
+        Operation<F, OrderedUpdate<K, V>>: Codec,
+    {
+        let pre_locations = pre_locations(batch);
+        let old = read_old_records(base, &batch.inner.diff, &pre_locations).await?;
+        let prepared = prepare_from_batch(mutated, batch, &pre_locations, &old)?;
         check_policy(&replay, prepared.made_inactive())
             .map_err(|_| BuildError::UnsupportedFloorPolicy)?;
 
@@ -216,9 +337,9 @@ impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
         // Claims and floor candidates both read the pre-state for the prepared batch, and
         // neither needs the other.
         let (pre_state_claims, walked) = try_join!(
-            self.claims(&base, &expanded, &prepared, &old),
+            self.claims(base, mutated, &prepared, &old),
             build_candidate_proof(
-                &base,
+                base,
                 &prepared,
                 &known,
                 commitment.size(),
@@ -294,7 +415,7 @@ impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
                 &mut check,
             )?;
         }
-        Ok((bundle, batch))
+        Ok(bundle)
     }
 
     /// Construct a complete proof from this database's current committed checkpoint.
@@ -363,7 +484,7 @@ impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
     async fn claims<F, E, C, V, I, H, const N: usize, S>(
         &self,
         base: &Base<'_, F, E, C, K, V, I, H, N, S>,
-        expanded: &BTreeMap<K, Option<&A>>,
+        mutated: &BTreeMap<K, bool>,
         prepared: &PreparedOrderedBatch<F, K, V>,
         old: &[ExactRecord<F, K, V>],
     ) -> Result<Vec<PreStateKeyClaim<F, K, V>>, BuildError<F>>
@@ -398,7 +519,7 @@ impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
             (None, None) => Request::Unknown,
         };
         let mut requests = BTreeMap::new();
-        for key in expanded.keys() {
+        for key in mutated.keys() {
             requests.insert(key.clone(), request(key, true));
         }
         // Lower endpoints establish where each authenticated range walk must begin,
@@ -583,6 +704,147 @@ impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
         }
         Ok(expanded)
     }
+
+    /// Expand this batch's ranges in `base` and merkleize the result through the writer on
+    /// top of `base`. Returns each mutated key, with whether the batch sets it rather than
+    /// deletes it, and the merkleized batch.
+    #[allow(clippy::type_complexity)]
+    async fn merkleize_from<F, E, C, V, I, H, P, const N: usize, S>(
+        &self,
+        base: &Base<'_, F, E, C, K, V, I, H, N, S>,
+        policy: &mut P,
+    ) -> Result<
+        (
+            BTreeMap<K, bool>,
+            Arc<MerkleizedBatch<F, H::Digest, OrderedUpdate<K, V>, N, S>>,
+        ),
+        BuildError<F>,
+    >
+    where
+        F: Graftable,
+        E: Context,
+        C: Mutable<Item = Operation<F, OrderedUpdate<K, V>>>,
+        V: ValueEncoding<Value = A>,
+        I: OrderedIndex<Value = Location<F>> + 'static,
+        H: Hasher,
+        S: Strategy,
+        P: Policy<F, K, A> + Send,
+        Operation<F, OrderedUpdate<K, V>>: Codec,
+    {
+        let expanded = self.expand(base).await?;
+        let mut writer = base.new_batch();
+        for (key, value) in &expanded {
+            writer = writer.write(key.clone(), value.cloned());
+        }
+        let batch = writer
+            .merkleize(base.db, self.metadata().cloned(), policy)
+            .await?;
+        let mutated = expanded
+            .into_iter()
+            .map(|(key, value)| (key, value.is_some()))
+            .collect();
+        Ok((mutated, batch))
+    }
+}
+
+/// A batch merkleized through the database writer, whose proof bundle is built later.
+///
+/// [`UserBatch::merkleize_provable`] and [`UserBatch::merkleize_provable_on`] return one.
+/// The next batch can be built on [`batch`](Self::batch) at once, while
+/// [`bundle`](Self::bundle) builds this one's proof, on this task or another: this value owns
+/// everything it needs, and takes the database only to build the bundle.
+pub struct ProvableBatch<F, K, V, H, P, const N: usize, S>
+where
+    F: Graftable,
+    K: Key,
+    V: ValueEncoding,
+    H: Hasher,
+    S: Strategy,
+{
+    user: UserBatch<K, V::Value>,
+    /// The pending batch this one was built on, if any.
+    parent: Option<Pending<F, K, V, H, N, S>>,
+    /// Each key the batch mutates, and whether it sets the key rather than deletes it.
+    mutated: BTreeMap<K, bool>,
+    batch: Pending<F, K, V, H, N, S>,
+    /// The writer's policy before this batch, from which the bundle replays the floor walk.
+    replay: P,
+}
+
+impl<F, K, V, H, P, const N: usize, S> ProvableBatch<F, K, V, H, P, N, S>
+where
+    F: Graftable,
+    K: Key,
+    V: ValueEncoding,
+    V::Value: Clone + Send + Sync,
+    H: Hasher,
+    S: Strategy,
+    P: Policy<F, K, V::Value> + Clone + Send,
+{
+    /// The merkleized batch, unapplied. The next batch can be built on it.
+    #[allow(clippy::type_complexity)]
+    pub const fn batch(&self) -> &Arc<MerkleizedBatch<F, H::Digest, OrderedUpdate<K, V>, N, S>> {
+        &self.batch
+    }
+
+    /// The batch whose mutations this one merkleized, which a recipient verifies the
+    /// bundle with.
+    pub const fn user_batch(&self) -> &UserBatch<K, V::Value> {
+        &self.user
+    }
+
+    /// Build this batch's proof bundle from `db`, the database that merkleized it: the
+    /// bundle [`UserBatch::prove`] or [`UserBatch::prove_on`] returns for it.
+    ///
+    /// The proof starts from the state the batch was built on, so `db` must still be able to
+    /// read it. A batch built on the database fails with [`crate::qmdb::Error::StaleRead`]
+    /// once the database changes. A batch built on a pending parent fails as
+    /// [`UserBatch::prove_on`] does on that parent: the database may apply the parent's
+    /// chain meanwhile, but not this batch or anything else, and every unapplied batch in the
+    /// chain must still be held. The parent is held by this value.
+    ///
+    /// Building the bundle changes neither the database nor this value, so it can be built
+    /// again, for example after a storage error.
+    ///
+    /// # Complexity
+    ///
+    /// That of [`UserBatch::prove`] (or [`UserBatch::prove_on`] on a parent) without
+    /// [`UserBatch::merkleize`]'s.
+    pub async fn bundle<E, C, I>(
+        &self,
+        db: &ordered::db::Db<F, E, C, K, V, I, H, N, S>,
+    ) -> Result<BatchProofBundle<F, K, V, H, N>, BuildError<F>>
+    where
+        E: Context,
+        C: Mutable<Item = Operation<F, OrderedUpdate<K, V>>>,
+        I: OrderedIndex<Value = Location<F>>,
+        Operation<F, OrderedUpdate<K, V>>: Codec,
+    {
+        let base = match &self.parent {
+            Some(parent) => Base::chain(db, parent)?,
+            None => {
+                self.batch
+                    .inner
+                    .bounds
+                    .base
+                    .compatible(&db.any, db.any.commitment())
+                    .map_err(BuildError::Database)?;
+                Base::db(db)
+            }
+        };
+        let commitment = base.commitment()?;
+        let opening = base.opening(commitment).await?;
+        self.user
+            .bundle_from(
+                &base,
+                commitment,
+                opening,
+                &self.mutated,
+                &self.batch,
+                self.replay.clone(),
+            )
+            .await
+    }
 }
 
 /// How a claim's key is established in the pre-state.
@@ -690,11 +952,11 @@ where
 /// The writer emits the application operations first: deletes, sets, then the predecessor
 /// rewrites that keep successor links intact. Floor copies and the commit follow. A key the
 /// caller did not mutate is in the diff either as a rewritten predecessor, whose final
-/// successor differs from its old one, or as a record the floor walk moved unchanged. `old`
-/// holds the record at each entry's pre-state location in `pre_locations`, in the diff's key
-/// order.
+/// successor differs from its old one, or as a record the floor walk moved unchanged.
+/// `mutated` holds each key the caller mutated and whether it sets the key. `old` holds the
+/// record at each entry's pre-state location in `pre_locations`, in the diff's key order.
 fn prepare_from_batch<F, K, V, D, const N: usize, S>(
-    expanded: &BTreeMap<K, Option<&V::Value>>,
+    mutated: &BTreeMap<K, bool>,
     batch: &MerkleizedBatch<F, D, OrderedUpdate<K, V>, N, S>,
     pre_locations: &[Option<Location<F>>],
     old: &[ExactRecord<F, K, V>],
@@ -714,12 +976,12 @@ where
     let mut count = 0usize;
     for ((key, entry), location) in batch.inner.diff.iter().zip(pre_locations) {
         let record = location.and_then(|_| old.next());
-        match (expanded.get(key), entry, record) {
-            (Some(None), DiffEntry::Deleted { .. }, Some((location, _))) => {
+        match (mutated.get(key), entry, record) {
+            (Some(false), DiffEntry::Deleted { .. }, Some((location, _))) => {
                 deleted_keys.insert(key.clone());
                 superseded.insert(*location);
             }
-            (Some(Some(_)), DiffEntry::Active { .. }, record) => {
+            (Some(true), DiffEntry::Active { .. }, record) => {
                 superseded.extend(record.map(|(location, _)| *location));
             }
             (None, DiffEntry::Active { loc, .. }, Some((location, update))) => {

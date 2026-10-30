@@ -21,6 +21,7 @@ use crate::{
             batch::{DiffEntry, lookup_sorted},
             operation::{Operation, update},
         },
+        chain,
         current::{
             batch::{MerkleizedBatch, UnmerkleizedBatch},
             db::compute_ops_root_witness,
@@ -113,15 +114,34 @@ where
     }
 
     /// The state after `tip`, a pending batch `db` created. Returns
-    /// [`qmdb::Error::StaleRead`] unless `db` is at a state of `tip`'s chain.
+    /// [`qmdb::Error::StaleRead`] unless `db` is at a state of `tip`'s chain, and
+    /// [`qmdb::Error::StaleBatch`] if an unapplied batch in the chain was dropped.
+    ///
+    /// The second check is the one merkleizing a child of `tip` makes. Merkle node reads
+    /// follow the chain's weak parent links, and past a dropped batch they would find the
+    /// database's older nodes.
     pub(super) fn chain(
         db: &'a Db<F, E, C, K, V, I, H, N, S>,
         tip: &'a Pending<F, K, V, H, N, S>,
     ) -> Result<Self, BuildError<F>> {
+        let current = db.any.commitment();
         tip.inner
             .bounds
-            .compatible(&db.any, db.any.commitment())
+            .compatible(&db.any, current)
             .map_err(BuildError::Database)?;
+        let held = chain::parent_and_ancestors(Some(&tip.inner), |batch| batch.ancestors())
+            .collect::<Vec<_>>();
+        let boundary = chain::effective_boundary(
+            tip.inner.bounds.db,
+            held.last().map(|oldest| oldest.bounds.base),
+        );
+        chain::merkleizable(
+            &db.any,
+            current,
+            boundary,
+            held.iter().map(|batch| batch.commitment()),
+        )
+        .map_err(BuildError::Database)?;
         Ok(Self { db, tip: Some(tip) })
     }
 
