@@ -34,7 +34,7 @@ use commonware_cryptography::Hasher;
 use commonware_parallel::Strategy;
 use commonware_utils::{NZU64, futures::try_join_all, range::contains_cyclic};
 use core::ops::{Bound, RangeBounds as _};
-use futures::{StreamExt as _, TryStreamExt as _, pin_mut};
+use futures::{StreamExt as _, pin_mut};
 use std::{collections::BTreeSet, sync::Arc};
 
 type OrderedUpdate<K, V> = update::Ordered<K, V>;
@@ -322,16 +322,13 @@ where
 
     /// The active keys in `range` in this state, ascending.
     ///
-    /// Under a chain, the database still holds the keys the chain deleted, so the read follows
-    /// this state's successor links from the range's first active key instead of scanning the
-    /// database's keys: it reads one record per active key in the range.
+    /// The read follows this state's successor links from the range's first active key, one
+    /// key lookup per active key in the range. Under a chain, a scan of the database's keys
+    /// would also read every key the chain deleted.
     pub(super) async fn keys_in(
         &self,
         range: (Bound<K>, Bound<K>),
     ) -> Result<Vec<K>, BuildError<F>> {
-        if self.tip.is_none() {
-            return Ok(self.db.keys(range).try_collect().await?);
-        }
         let mut keys = Vec::new();
         let mut next = match &range.0 {
             Bound::Unbounded => self.first_key().await?,
