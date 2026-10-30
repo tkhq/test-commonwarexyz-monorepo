@@ -1415,62 +1415,58 @@ type PendingBatch<F, V, S> = std::sync::Arc<
     >,
 >;
 
-// Callers spawn proof construction, so its futures must be `Send` for every family and
-// strategy, with fixed and variable values, from the database and on a pending batch.
+// Callers spawn proof construction, so its futures must be `Send` for every family, strategy
+// and policy the prover accepts, including a policy that is not `Sync`, with fixed and
+// variable values, from the database and on a pending batch.
 #[allow(dead_code)]
-fn assert_prover_futures_are_send<F: Graftable, S: Strategy>(
+fn assert_prover_futures_are_send<F: Graftable, S: Strategy, P>(
     fixed: &TestDb<F, S>,
     fixed_parent: &PendingBatch<F, FixedEncoding<Key>, S>,
     variable: &VariableDb<F, S>,
     variable_parent: &PendingBatch<F, crate::qmdb::any::value::VariableEncoding<Vec<u8>>, S>,
     batch: &Batch,
     values: &UserBatch<Key, Vec<u8>>,
-) {
-    assert_send(batch.prove(fixed, &mut Proportional));
-    assert_send(batch.build_batch_proof(fixed, &Proportional));
-    assert_send(batch.prove_on(fixed_parent, fixed, &mut Proportional));
-    assert_send(batch.build_batch_proof_on(fixed_parent, fixed, &Proportional));
-    assert_send(values.prove(variable, &mut Proportional));
-    assert_send(values.build_batch_proof(variable, &Proportional));
-    assert_send(values.prove_on(variable_parent, variable, &mut Proportional));
-    assert_send(values.build_batch_proof_on(variable_parent, variable, &Proportional));
+    policy: &mut P,
+) where
+    P: Policy<F, Key, Key> + Policy<F, Key, Vec<u8>> + Clone + Send,
+{
+    assert_send(batch.prove(fixed, policy));
+    assert_send(batch.build_batch_proof(fixed, policy));
+    assert_send(batch.prove_on(fixed_parent, fixed, policy));
+    assert_send(batch.build_batch_proof_on(fixed_parent, fixed, policy));
+    assert_send(values.prove(variable, policy));
+    assert_send(values.build_batch_proof(variable, policy));
+    assert_send(values.prove_on(variable_parent, variable, policy));
+    assert_send(values.build_batch_proof_on(variable_parent, variable, policy));
 }
 
 /// A fixed-value batch awaiting its bundle.
-type FixedProvable<F, S> = ProvableBatch<F, Key, FixedEncoding<Key>, Sha256, Proportional, 32, S>;
+type FixedProvable<F, S, P> = ProvableBatch<F, Key, FixedEncoding<Key>, Sha256, P, 32, S>;
 
 /// A variable-value batch awaiting its bundle.
-type VariableProvable<F, S> = ProvableBatch<
-    F,
-    Key,
-    crate::qmdb::any::value::VariableEncoding<Vec<u8>>,
-    Sha256,
-    Proportional,
-    32,
-    S,
->;
+type VariableProvable<F, S, P> =
+    ProvableBatch<F, Key, crate::qmdb::any::value::VariableEncoding<Vec<u8>>, Sha256, P, 32, S>;
 
-// The split API's futures must be `Send` as well, and a batch awaiting its bundle must be able
-// to move to another task.
+// The split API's futures must be `Send` as well, for every policy `prove` accepts, including
+// one that is not `Sync`, and a batch awaiting its bundle must be able to move to another task.
 #[allow(dead_code)]
-fn assert_split_is_send<F: Graftable, S: Strategy>(
+fn assert_split_is_send<F: Graftable, S: Strategy, P>(
     fixed: &TestDb<F, S>,
     fixed_parent: &PendingBatch<F, FixedEncoding<Key>, S>,
     variable: &VariableDb<F, S>,
     variable_parent: &PendingBatch<F, crate::qmdb::any::value::VariableEncoding<Vec<u8>>, S>,
-    fixed_provable: FixedProvable<F, S>,
-    variable_provable: VariableProvable<F, S>,
-) {
-    fn assert_static<T: Send + Sync + 'static>(_: T) {}
-    assert_send(Batch::new().merkleize_provable(fixed, &mut Proportional));
-    assert_send(Batch::new().merkleize_provable_on(fixed_parent, fixed, &mut Proportional));
+    fixed_provable: FixedProvable<F, S, P>,
+    variable_provable: VariableProvable<F, S, P>,
+    policy: &mut P,
+) where
+    P: Policy<F, Key, Key> + Policy<F, Key, Vec<u8>> + Clone + Send + 'static,
+{
+    fn assert_static<T: Send + 'static>(_: T) {}
+    assert_send(Batch::new().merkleize_provable(fixed, policy));
+    assert_send(Batch::new().merkleize_provable_on(fixed_parent, fixed, policy));
     assert_send(fixed_provable.bundle(fixed));
-    assert_send(UserBatch::new().merkleize_provable(variable, &mut Proportional));
-    assert_send(UserBatch::new().merkleize_provable_on(
-        variable_parent,
-        variable,
-        &mut Proportional,
-    ));
+    assert_send(UserBatch::new().merkleize_provable(variable, policy));
+    assert_send(UserBatch::new().merkleize_provable_on(variable_parent, variable, policy));
     assert_send(variable_provable.bundle(variable));
     assert_static(fixed_provable);
     assert_static(variable_provable);

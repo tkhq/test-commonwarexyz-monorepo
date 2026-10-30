@@ -423,11 +423,11 @@ impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
     /// This is [`prove`](Self::prove) with a copy of `policy`, discarding the merkleized
     /// batch: the caller's policy does not change. Use `prove` to keep the batch rather than
     /// merkleize it again. Keep this checkpoint until the corresponding batch is merkleized.
-    pub async fn build_batch_proof<F, E, C, V, I, H, P, const N: usize, S>(
+    pub fn build_batch_proof<F, E, C, V, I, H, P, const N: usize, S>(
         &self,
         db: &ordered::db::Db<F, E, C, K, V, I, H, N, S>,
         policy: &P,
-    ) -> Result<BatchProofBundle<F, K, V, H, N>, BuildError<F>>
+    ) -> impl Future<Output = Result<BatchProofBundle<F, K, V, H, N>, BuildError<F>>>
     where
         F: Graftable,
         E: Context,
@@ -439,9 +439,9 @@ impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
         P: Policy<F, K, A> + Clone + Send,
         Operation<F, OrderedUpdate<K, V>>: Codec,
     {
-        self.prove(db, &mut policy.clone())
-            .await
-            .map(|(bundle, _)| bundle)
+        // The future owns its copy, so it is `Send` for a policy that is not `Sync`.
+        let mut policy = policy.clone();
+        async move { self.prove(db, &mut policy).await.map(|(bundle, _)| bundle) }
     }
 
     /// Construct a complete proof on top of `parent`, a pending batch `db` created.
@@ -450,12 +450,12 @@ impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
     /// merkleized batch, as [`build_batch_proof`](Self::build_batch_proof) is for
     /// [`prove`](Self::prove).
     #[allow(clippy::type_complexity)]
-    pub async fn build_batch_proof_on<F, E, C, V, I, H, P, const N: usize, S>(
+    pub fn build_batch_proof_on<F, E, C, V, I, H, P, const N: usize, S>(
         &self,
         parent: &Arc<MerkleizedBatch<F, H::Digest, OrderedUpdate<K, V>, N, S>>,
         db: &ordered::db::Db<F, E, C, K, V, I, H, N, S>,
         policy: &P,
-    ) -> Result<BatchProofBundle<F, K, V, H, N>, BuildError<F>>
+    ) -> impl Future<Output = Result<BatchProofBundle<F, K, V, H, N>, BuildError<F>>>
     where
         F: Graftable,
         E: Context,
@@ -467,9 +467,13 @@ impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
         P: Policy<F, K, A> + Clone + Send,
         Operation<F, OrderedUpdate<K, V>>: Codec,
     {
-        self.prove_on(parent, db, &mut policy.clone())
-            .await
-            .map(|(bundle, _)| bundle)
+        // As in `build_batch_proof`, the future owns its copy of the policy.
+        let mut policy = policy.clone();
+        async move {
+            self.prove_on(parent, db, &mut policy)
+                .await
+                .map(|(bundle, _)| bundle)
+        }
     }
 
     /// Build the pre-state key claims, in key order, from the batch's old records.
@@ -810,40 +814,44 @@ where
     ///
     /// That of [`UserBatch::prove`] (or [`UserBatch::prove_on`] on a parent) without
     /// [`UserBatch::merkleize`]'s.
-    pub async fn bundle<E, C, I>(
+    pub fn bundle<E, C, I>(
         &self,
         db: &ordered::db::Db<F, E, C, K, V, I, H, N, S>,
-    ) -> Result<BatchProofBundle<F, K, V, H, N>, BuildError<F>>
+    ) -> impl Future<Output = Result<BatchProofBundle<F, K, V, H, N>, BuildError<F>>>
     where
         E: Context,
         C: Mutable<Item = Operation<F, OrderedUpdate<K, V>>>,
         I: OrderedIndex<Value = Location<F>>,
         Operation<F, OrderedUpdate<K, V>>: Codec,
     {
-        let base = match &self.parent {
-            Some(parent) => Base::chain(db, parent)?,
-            None => {
-                self.batch
-                    .inner
-                    .bounds
-                    .base
-                    .compatible(&db.any, db.any.commitment())
-                    .map_err(BuildError::Database)?;
-                Base::db(db)
-            }
-        };
-        let commitment = base.commitment()?;
-        let opening = base.opening(commitment).await?;
-        self.user
-            .bundle_from(
-                &base,
-                commitment,
-                opening,
-                &self.mutated,
-                &self.batch,
-                self.replay.clone(),
-            )
-            .await
+        // The future borrows the other fields and owns its copy of the policy, so it is `Send`
+        // for a policy that is not `Sync`.
+        let Self {
+            user,
+            parent,
+            mutated,
+            batch,
+            replay,
+        } = self;
+        let replay = replay.clone();
+        async move {
+            let base = match parent {
+                Some(parent) => Base::chain(db, parent)?,
+                None => {
+                    batch
+                        .inner
+                        .bounds
+                        .base
+                        .compatible(&db.any, db.any.commitment())
+                        .map_err(BuildError::Database)?;
+                    Base::db(db)
+                }
+            };
+            let commitment = base.commitment()?;
+            let opening = base.opening(commitment).await?;
+            user.bundle_from(&base, commitment, opening, mutated, batch, replay)
+                .await
+        }
     }
 }
 
