@@ -440,46 +440,58 @@ impl<K: Key, A: Clone + Send + Sync> UserBatch<K, A> {
             requests.insert(record.1.key.clone(), Request::Member(record));
         }
 
-        // Settle the keys the batch did not reveal. An absent key's span owner comes from the
-        // pre-state's lookups; an empty pre-state has none and needs no claim.
-        let claims = try_join_all(requests.into_iter().map(|(key, request)| async move {
-            let request = match request {
-                Request::Unknown => base
-                    .member(&key)
+        // Settle the keys the batch did not reveal, the only ones that need the pre-state's
+        // lookups. An absent key's span owner comes from them too; an empty pre-state has none
+        // and needs no claim.
+        let unsettled = requests
+            .iter()
+            .filter_map(|(key, request)| match request {
+                Request::Unknown => Some((key.clone(), true)),
+                Request::Absent => Some((key.clone(), false)),
+                Request::Member(_) | Request::Excluded(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let settled = try_join_all(unsettled.into_iter().map(|(key, unknown)| async move {
+            let member = if unknown {
+                base.member(&key).await?
+            } else {
+                None
+            };
+            let request = match member {
+                Some(record) => Request::Member(record),
+                None => base
+                    .span_owner(&key)
                     .await?
-                    .map_or(Request::Absent, Request::Member),
-                request => request,
+                    .map_or(Request::Absent, Request::Excluded),
             };
-            let request = match request {
-                Request::Absent => match base.span_owner(&key).await? {
-                    Some(owner) => Request::Excluded(owner),
-                    None => return Ok(None),
-                },
-                request => request,
-            };
-            Ok::<_, BuildError<F>>(Some(match request {
+            Ok::<_, BuildError<F>>((key, request))
+        }))
+        .await?;
+        requests.extend(settled);
+        requests
+            .into_iter()
+            .filter_map(|(key, request)| match request {
                 Request::Member((location, update)) => {
-                    PreStateKeyClaim::Member(PreStateMemberClaim {
+                    Some(Ok(PreStateKeyClaim::Member(PreStateMemberClaim {
                         location,
                         key,
                         value: update.value,
                         next_key: update.next_key,
-                    })
+                    })))
                 }
                 Request::Excluded((location, owner)) => {
-                    PreStateKeyClaim::Exclusion(PreStateExclusionClaim {
+                    Some(Ok(PreStateKeyClaim::Exclusion(PreStateExclusionClaim {
                         queried_key: key,
                         location,
                         owner,
-                    })
+                    })))
                 }
-                Request::Absent | Request::Unknown => {
-                    return Err(BuildError::InvalidState("an absent key was not resolved"));
-                }
-            }))
-        }))
-        .await?;
-        Ok(claims.into_iter().flatten().collect())
+                Request::Absent => None,
+                Request::Unknown => Some(Err(BuildError::InvalidState(
+                    "a key the batch did not reveal was not looked up",
+                ))),
+            })
+            .collect()
     }
 
     /// Merkleize the same normalized mutations through the ordinary database writer.
@@ -642,24 +654,39 @@ where
     S: Strategy,
     Operation<F, OrderedUpdate<K, V>>: Codec,
 {
-    // The reads are built in a loop, not by closures over references, so that the future stays
-    // `Send` for callers that spawn it: a closure taking a reference has a higher-ranked type the
-    // compiler cannot prove `Send` across the `await`.
-    let mut reads = Vec::new();
-    for ((key, _), location) in diff.iter().zip(pre_locations) {
-        let Some(location) = *location else {
-            continue;
-        };
-        reads.push(async move {
-            match base.read(location).await? {
-                Operation::Update(update) if update.key == *key => Ok((location, update)),
-                _ => Err(BuildError::InvalidState(
-                    "a batch's base location does not hold its key's update",
-                )),
-            }
-        });
+    // One batched read in location order. Each location holds a single key's update.
+    let mut reads = diff
+        .iter()
+        .zip(pre_locations)
+        .filter_map(|((key, _), location)| location.map(|location| (location, key)))
+        .collect::<Vec<_>>();
+    reads.sort_unstable_by_key(|(location, _)| *location);
+    if reads
+        .windows(2)
+        .any(|pair| matches!(pair, [(a, _), (b, _)] if a == b))
+    {
+        return Err(BuildError::InvalidState(
+            "two of a batch's keys have the same base location",
+        ));
     }
-    try_join_all(reads).await
+    let locations = reads
+        .iter()
+        .map(|(location, _)| *location)
+        .collect::<Vec<_>>();
+    let operations = base.read_many(&locations).await?;
+    let mut records = reads
+        .into_iter()
+        .zip(operations)
+        .map(|((location, key), operation)| match operation {
+            Operation::Update(update) if update.key == *key => Ok((location, update)),
+            _ => Err(BuildError::InvalidState(
+                "a batch's base location does not hold its key's update",
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    // Back to the diff's key order.
+    records.sort_unstable_by(|(_, a), (_, b)| a.key.cmp(&b.key));
+    Ok(records)
 }
 
 /// Recover from a merkleized batch the transition a verifier derives for it.
@@ -799,21 +826,30 @@ where
         u64::try_from(policy.limits(prepared.made_inactive()).entries).unwrap_or(u64::MAX);
     let locations = base.candidate_locations(old_floor, pre_size, &prepared.superseded, entries);
 
-    // Read that ordered location list concurrently; every surviving bit must still resolve to
-    // an update. Verification later authenticates all payloads.
-    let mut operations = try_join_all(locations.iter().copied().map(|location| async move {
+    // Read the records the batch did not in one batch, in that ascending order; every
+    // surviving bit must still resolve to an update. Verification later authenticates all
+    // payloads.
+    let unread = locations
+        .iter()
+        .copied()
+        .filter(|location| !known.contains_key(location))
+        .collect::<Vec<_>>();
+    let mut read = base.read_many(&unread).await?.into_iter();
+    let mut operations = Vec::with_capacity(locations.len());
+    for location in locations {
         let operation = match known.get(&location) {
             Some(&update) => Operation::Update(update.clone()),
-            None => base.read(location).await?,
+            None => read.next().ok_or(BuildError::InvalidState(
+                "a batched read returned fewer operations than requested",
+            ))?,
         };
         if !prepared.superseded.contains(&location) && !matches!(operation, Operation::Update(_)) {
             return Err(BuildError::InvalidState(
                 "a non-terminal active bitmap bit references a non-update operation",
             ));
         }
-        Ok((location, operation))
-    }))
-    .await?;
+        operations.push((location, operation));
+    }
 
     let updates = operations
         .iter()
