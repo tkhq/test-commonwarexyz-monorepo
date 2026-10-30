@@ -1374,3 +1374,32 @@ fn mmr_range_claims_cover_an_interval() {
 fn mmb_range_claims_cover_an_interval() {
     deterministic::Runner::default().start(range_claims::<mmb::Family>);
 }
+
+fn assert_send<T: Send>(_: T) {}
+
+/// The variable-size database the `Send` check covers beside the fixed one.
+type VariableDb<F, S> = crate::qmdb::current::ordered::variable::Db<
+    F,
+    deterministic::Context,
+    Key,
+    Vec<u8>,
+    Sha256,
+    OneCap,
+    32,
+    S,
+>;
+
+// Callers spawn proof construction, so its futures must be `Send` for every family and
+// strategy, with fixed and variable values.
+#[allow(dead_code)]
+fn assert_prover_futures_are_send<F: Graftable, S: Strategy>(
+    fixed: &TestDb<F, S>,
+    variable: &VariableDb<F, S>,
+    batch: &Batch,
+    values: &UserBatch<Key, Vec<u8>>,
+) {
+    assert_send(batch.prove(fixed, &mut Proportional));
+    assert_send(batch.build_batch_proof(fixed, &Proportional));
+    assert_send(values.prove(variable, &mut Proportional));
+    assert_send(values.build_batch_proof(variable, &Proportional));
+}
