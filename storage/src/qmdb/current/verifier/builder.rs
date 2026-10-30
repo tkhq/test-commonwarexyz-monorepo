@@ -814,40 +814,44 @@ where
     ///
     /// That of [`UserBatch::prove`] (or [`UserBatch::prove_on`] on a parent) without
     /// [`UserBatch::merkleize`]'s.
-    pub async fn bundle<E, C, I>(
+    pub fn bundle<E, C, I>(
         &self,
         db: &ordered::db::Db<F, E, C, K, V, I, H, N, S>,
-    ) -> Result<BatchProofBundle<F, K, V, H, N>, BuildError<F>>
+    ) -> impl Future<Output = Result<BatchProofBundle<F, K, V, H, N>, BuildError<F>>>
     where
         E: Context,
         C: Mutable<Item = Operation<F, OrderedUpdate<K, V>>>,
         I: OrderedIndex<Value = Location<F>>,
         Operation<F, OrderedUpdate<K, V>>: Codec,
     {
-        let base = match &self.parent {
-            Some(parent) => Base::chain(db, parent)?,
-            None => {
-                self.batch
-                    .inner
-                    .bounds
-                    .base
-                    .compatible(&db.any, db.any.commitment())
-                    .map_err(BuildError::Database)?;
-                Base::db(db)
-            }
-        };
-        let commitment = base.commitment()?;
-        let opening = base.opening(commitment).await?;
-        self.user
-            .bundle_from(
-                &base,
-                commitment,
-                opening,
-                &self.mutated,
-                &self.batch,
-                self.replay.clone(),
-            )
-            .await
+        // The future borrows the other fields and owns its copy of the policy, so it is `Send`
+        // for a policy that is not `Sync`.
+        let Self {
+            user,
+            parent,
+            mutated,
+            batch,
+            replay,
+        } = self;
+        let replay = replay.clone();
+        async move {
+            let base = match parent {
+                Some(parent) => Base::chain(db, parent)?,
+                None => {
+                    batch
+                        .inner
+                        .bounds
+                        .base
+                        .compatible(&db.any, db.any.commitment())
+                        .map_err(BuildError::Database)?;
+                    Base::db(db)
+                }
+            };
+            let commitment = base.commitment()?;
+            let opening = base.opening(commitment).await?;
+            user.bundle_from(&base, commitment, opening, mutated, batch, replay)
+                .await
+        }
     }
 }
 
