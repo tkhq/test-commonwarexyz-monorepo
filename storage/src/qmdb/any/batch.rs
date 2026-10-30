@@ -3112,7 +3112,7 @@ impl<F: Family, D: Digest, U: update::Update, S: Strategy> MerkleizedBatch<F, D,
     /// reachable ancestor, so only the entry carries the key's location at the recorded boundary,
     /// and applying the child at that boundary needs it (see [`StagedLoc`]). The batch keeps every
     /// retained diff, because a bounded initialization can make those layers unapplied again.
-    fn read_diffs(
+    pub(crate) fn read_diffs(
         &self,
         db_size: Location<F>,
     ) -> impl Iterator<Item = &DiffSlice<U::Key, F, U::Value>> {
@@ -3148,7 +3148,7 @@ impl<F: Family, D: Digest, U: update::Update, S: Strategy> MerkleizedBatch<F, D,
 
     /// The retained operation chunks newest first, each with the location of its first
     /// operation: this batch's own operations, then each retained ancestor's.
-    fn chunks(&self) -> impl Iterator<Item = (u64, &[Operation<F, U>])> {
+    pub(crate) fn chunks(&self) -> impl Iterator<Item = (u64, &[Operation<F, U>])> {
         let mut base = *self.bounds.tip.size;
         iter::once(self.journal_batch.items())
             .chain(self.journal_batch.ancestor_items.iter().rev())
