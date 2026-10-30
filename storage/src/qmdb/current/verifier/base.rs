@@ -172,6 +172,37 @@ where
             .map_err(qmdb::Error::Journal)?)
     }
 
+    /// The operations at `locations`, which must be strictly increasing, in this state's log.
+    ///
+    /// The database's come from one batched read, which serves cached ones without I/O. The
+    /// chain's operations follow the database's in the log, and come from memory.
+    pub(super) async fn read_many(
+        &self,
+        locations: &[Location<F>],
+    ) -> Result<Vec<Operation<F, OrderedUpdate<K, V>>>, BuildError<F>> {
+        let stored = locations
+            .iter()
+            .take_while(|location| self.appended(**location).is_none())
+            .map(|location| location.as_u64())
+            .collect::<Vec<_>>();
+        let mut operations = self
+            .db
+            .any
+            .log
+            .read_many(&stored)
+            .await
+            .map_err(qmdb::Error::Journal)?;
+        for location in locations.iter().skip(stored.len()) {
+            let Some(operation) = self.appended(*location) else {
+                return Err(BuildError::InvalidState(
+                    "a read location is outside the pending chain's operations",
+                ));
+            };
+            operations.push(operation.clone());
+        }
+        Ok(operations)
+    }
+
     /// The update the chain appended at `location`, the location of an active diff entry.
     fn appended_update(
         &self,
