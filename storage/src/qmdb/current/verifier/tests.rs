@@ -3,7 +3,7 @@
 use super::{
     BatchProofBundle, BitmapFault, BitmapProof, BitmapUnit, BuildError, BundleConfig,
     CandidateFault, CurrentCommitment, InsufficientPreState, PreStateKeyClaim,
-    PreStateOpeningClaim, TrustedMap, UserBatch, UserOp, VerifyError,
+    PreStateOpeningClaim, ProvableBatch, TrustedMap, UserBatch, UserOp, VerifyError,
     subtree::{SubtreeTarget, create_multi_subtree_proof},
 };
 use crate::{
@@ -1236,6 +1236,21 @@ fn prover_refuses_unsupported_policies() {
             batch.build_batch_proof(&db, &skip_limited).await,
             Err(BuildError::UnsupportedFloorPolicy)
         ));
+        // The split API refuses an evicting policy before merkleizing, and the rest once the
+        // bundle replays the walk.
+        assert!(matches!(
+            batch.clone().merkleize_provable(&db, &mut Evict).await,
+            Err(BuildError::UnsupportedFloorPolicy)
+        ));
+        let provable = batch
+            .clone()
+            .merkleize_provable(&db, &mut skip_limited.clone())
+            .await
+            .unwrap();
+        assert!(matches!(
+            provable.bundle(&db).await,
+            Err(BuildError::UnsupportedFloorPolicy)
+        ));
         db.destroy().await.unwrap();
     });
 }
@@ -1423,4 +1438,44 @@ fn assert_prover_futures_are_send<F: Graftable, S: Strategy, P>(
     assert_send(values.build_batch_proof(variable, policy));
     assert_send(values.prove_on(variable_parent, variable, policy));
     assert_send(values.build_batch_proof_on(variable_parent, variable, policy));
+}
+
+/// A fixed-value batch awaiting its bundle.
+type FixedProvable<F, S> = ProvableBatch<F, Key, FixedEncoding<Key>, Sha256, Proportional, 32, S>;
+
+/// A variable-value batch awaiting its bundle.
+type VariableProvable<F, S> = ProvableBatch<
+    F,
+    Key,
+    crate::qmdb::any::value::VariableEncoding<Vec<u8>>,
+    Sha256,
+    Proportional,
+    32,
+    S,
+>;
+
+// The split API's futures must be `Send` as well, and a batch awaiting its bundle must be able
+// to move to another task.
+#[allow(dead_code)]
+fn assert_split_is_send<F: Graftable, S: Strategy>(
+    fixed: &TestDb<F, S>,
+    fixed_parent: &PendingBatch<F, FixedEncoding<Key>, S>,
+    variable: &VariableDb<F, S>,
+    variable_parent: &PendingBatch<F, crate::qmdb::any::value::VariableEncoding<Vec<u8>>, S>,
+    fixed_provable: FixedProvable<F, S>,
+    variable_provable: VariableProvable<F, S>,
+) {
+    fn assert_static<T: Send + Sync + 'static>(_: T) {}
+    assert_send(Batch::new().merkleize_provable(fixed, &mut Proportional));
+    assert_send(Batch::new().merkleize_provable_on(fixed_parent, fixed, &mut Proportional));
+    assert_send(fixed_provable.bundle(fixed));
+    assert_send(UserBatch::new().merkleize_provable(variable, &mut Proportional));
+    assert_send(UserBatch::new().merkleize_provable_on(
+        variable_parent,
+        variable,
+        &mut Proportional,
+    ));
+    assert_send(variable_provable.bundle(variable));
+    assert_static(fixed_provable);
+    assert_static(variable_provable);
 }

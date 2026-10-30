@@ -23,6 +23,12 @@
 //! do, so the database may apply the chain's batches meanwhile. Applying any other batch
 //! leaves the chain stale.
 //!
+//! Merkleizing a batch must wait for the batch before it, but building its bundle need not.
+//! `UserBatch::merkleize_provable` and `UserBatch::merkleize_provable_on` merkleize a batch and
+//! return a `ProvableBatch`, on whose batch the next one can be built at once.
+//! `ProvableBatch::bundle` builds the bundle `UserBatch::prove` would have returned, later or on
+//! another task, while the database is still at a state the batch can be proved from.
+//!
 //! The prover otherwise works from the database's current state, the only one its key index,
 //! activity bitmap, and grafted tree hold. To prove a batch applied at an older checkpoint whose
 //! operations the database still retains, sync a scratch database to that checkpoint from the
@@ -228,6 +234,8 @@ mod trusted;
 mod user;
 
 pub use bitmap::{BitmapProof, BitmapUnit, ProvenBitmapProof};
+#[cfg(feature = "std")]
+pub use builder::ProvableBatch;
 pub use bundle::{
     BatchProofBundle, CandidateOperation, ClaimedBatchBounds, PreStateCandidateProof,
     PreStateExclusionClaim, PreStateKeyClaim, PreStateMemberClaim, PreStateOpeningClaim,

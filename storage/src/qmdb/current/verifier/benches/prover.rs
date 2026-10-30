@@ -4,7 +4,9 @@
 //! which returns the proof and the merkleized batch a writer sends and applies. Both merkleize the
 //! batch: `build_batch_proof` drops it. [`Timed::Merkleize`] times the writer alone,
 //! [`Timed::Chain`] times `UserBatch::prove_on` over pending batches, and [`Timed::Applied`]
-//! proves the same batch once those batches are applied. Database initialization, the
+//! proves the same batch once those batches are applied. [`Timed::SplitMerkleize`] and
+//! [`Timed::SplitBundle`] time the two steps of `UserBatch::merkleize_provable_on` over the same
+//! pending batches. Database initialization, the
 //! seeded bootstrap, batch generation, and runtime setup are outside the timer. The database uses
 //! the Tokio storage backend and `EightCap`, with Sequential or Rayon workers.
 
@@ -37,6 +39,12 @@ pub(crate) enum Timed {
     /// As [`Timed::Chain`], with the batches below applied first: the same batch from the
     /// same state.
     Applied,
+    /// The first step of [`Timed::Chain`] in two: merkleize the batch, keeping what its
+    /// bundle needs. Each iteration clones the batch, which the step takes by value.
+    SplitMerkleize,
+    /// The second step: build the bundle of the batch [`Timed::SplitMerkleize`] merkleized,
+    /// which is merkleized once before the timer.
+    SplitBundle,
 }
 
 pub(crate) fn bench_family<F: Graftable, S: Strategy>(
@@ -77,6 +85,21 @@ pub(crate) fn bench_family<F: Graftable, S: Strategy>(
                                             matches!(timed, Timed::Applied),
                                         )
                                         .await;
+                                        let provable = match timed {
+                                            Timed::SplitBundle => Some(
+                                                fixture
+                                                    .batch
+                                                    .clone()
+                                                    .merkleize_provable_on(
+                                                        fixture.pending.last().unwrap(),
+                                                        &fixture.database,
+                                                        &mut Proportional,
+                                                    )
+                                                    .await
+                                                    .unwrap(),
+                                            ),
+                                            _ => None,
+                                        };
                                         results.send(Duration::ZERO).unwrap();
                                         for iters in requests {
                                             let start = Instant::now();
@@ -114,10 +137,31 @@ pub(crate) fn bench_family<F: Graftable, S: Strategy>(
                                                             .await
                                                             .unwrap(),
                                                     )),
+                                                    Timed::SplitMerkleize => drop(black_box(
+                                                        fixture
+                                                            .batch
+                                                            .clone()
+                                                            .merkleize_provable_on(
+                                                                fixture.pending.last().unwrap(),
+                                                                &fixture.database,
+                                                                &mut Proportional,
+                                                            )
+                                                            .await
+                                                            .unwrap(),
+                                                    )),
+                                                    Timed::SplitBundle => drop(black_box(
+                                                        provable
+                                                            .as_ref()
+                                                            .unwrap()
+                                                            .bundle(&fixture.database)
+                                                            .await
+                                                            .unwrap(),
+                                                    )),
                                                 }
                                             }
                                             results.send(start.elapsed()).unwrap();
                                         }
+                                        drop(provable);
                                         fixture.database.destroy().await.unwrap();
                                     })
                                 });
