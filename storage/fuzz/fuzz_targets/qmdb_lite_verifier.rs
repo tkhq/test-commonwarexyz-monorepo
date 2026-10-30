@@ -8,19 +8,24 @@
 //!
 //! Input bytes: a little-endian u64 seed, then one byte each for rounds, actions, fault, mode,
 //! floor policy and policy bound, then a little-endian u16 offset and a byte mask for the
-//! encoding fault. Missing bytes default to zero. Mode values congruent to 1 modulo 16 select
-//! long cases: 16-64 batches of 80-320 actions over 4,095-4,097 initial keys in an 8,192-key
-//! space. Short cases run up to 16 batches of up to 48 actions. When mode bit 5 is set, every
-//! fourth batch also deletes an eighth of the key space, leaving runs of clear bitmap chunks
-//! for later floor scans to cross and the prover to cover with zero subtrees. When mode bit 6
-//! is set, every fourth batch starts with a range open below, above, or at both ends, which the
-//! batch's own sets then split.
+//! encoding fault, then a chain depth. Missing bytes default to zero. Mode values congruent to
+//! 1 modulo 16 select long cases: 16-64 batches of 80-320 actions over 4,095-4,097 initial keys
+//! in an 8,192-key space. Short cases run up to 16 batches of up to 48 actions. When mode bit 5
+//! is set, every fourth batch also deletes an eighth of the key space, leaving runs of clear
+//! bitmap chunks for later floor scans to cross and the prover to cover with zero subtrees.
+//! When mode bit 6 is set, every fourth batch starts with a range open below, above, or at both
+//! ends, which the batch's own sets then split.
+//!
+//! The chain depth, modulo 4, is how many proved batches may wait unapplied. Each later batch
+//! is proved on top of the pending one before it, against that batch's post-state, and once its
+//! parent is applied, proving it from the database must give the same bundle and batch. The
+//! oldest batch is applied whenever more are waiting.
 //!
 //! Build with debug assertions so arithmetic overflow is a crash:
 //!
 //! ```sh
 //! cd storage
-//! cargo +nightly fuzz run --debug-assertions qmdb_lite_verifier -- -max_len=17
+//! cargo +nightly fuzz run --debug-assertions qmdb_lite_verifier -- -max_len=18
 //! ```
 //!
 //! On macOS, if `crc-fast` fails to link coverage symbols, prefix the command with
@@ -46,7 +51,11 @@ use commonware_storage::{
     },
 };
 use libfuzzer_sys::fuzz_target;
-use std::{collections::BTreeMap, ops::Bound};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    ops::Bound,
+    sync::Arc,
+};
 
 // Short cases keep mutation throughput high; long cases exercise sustained log growth,
 // repeated floor moves, and larger batches across many bitmap chunks.
@@ -91,6 +100,7 @@ struct FuzzInput {
     bound: u8,
     offset: u16,
     mask: u8,
+    depth: u8,
 }
 
 /// Generous decoding limits for the bundles these workloads produce.
@@ -182,6 +192,7 @@ fn parse(data: &[u8]) -> FuzzInput {
         bound: byte(13),
         offset: u16::from_le_bytes([byte(14), byte(15)]),
         mask: byte(16).max(1),
+        depth: byte(17) % 4,
     }
 }
 
@@ -233,7 +244,10 @@ async fn run_family<F: Graftable>(context: deterministic::Context, input: FuzzIn
     // The writer and the verifier each advance their own copy of the policy once per batch.
     let mut writer_policy = FuzzPolicy::new(input);
     let mut verifier_policy = writer_policy.clone();
+    // The model of the applied state, and of the state after every proved batch.
     let mut model = BTreeMap::new();
+    let mut proved_model = BTreeMap::new();
+    let mut pending = VecDeque::<Pending<F>>::new();
     let mut pre = Commitment::<F>::from_parts(db.bounds().end, db.root()).unwrap();
     let mut trusted = TrustedMap::empty_cache(pre);
     for round in 0..=rounds {
@@ -286,14 +300,34 @@ async fn run_family<F: Graftable>(context: deterministic::Context, input: FuzzIn
         }
         let batch = &logical.batch;
         let open_below = matches!(batch.first().map(|op| op.start()), Some(Bound::Unbounded));
-        let proof = batch
-            .build_batch_proof(&db, &writer_policy)
-            .await
-            .expect("the database builds a complete proof");
-        let merkleized = batch
-            .merkleize(&db, &mut writer_policy)
-            .await
-            .expect("the database merkleizes the same batch");
+        let pre_empty = proved_model.is_empty();
+        let writer_before = writer_policy.clone();
+        let (proof, merkleized) = match pending.back() {
+            None => {
+                let proof = batch
+                    .build_batch_proof(&db, &writer_policy)
+                    .await
+                    .expect("the database builds a complete proof");
+                let merkleized = batch
+                    .merkleize(&db, &mut writer_policy)
+                    .await
+                    .expect("the database merkleizes the same batch");
+                (proof, merkleized)
+            }
+            Some(parent) => {
+                let proof = batch
+                    .build_batch_proof_on(&parent.merkleized, &db, &writer_policy)
+                    .await
+                    .expect("a pending batch builds a complete proof");
+                let (proved, merkleized) = batch
+                    .prove_on(&parent.merkleized, &db, &mut writer_policy)
+                    .await
+                    .expect("a pending batch proves the same batch");
+                assert_eq!(proved.encode(), proof.encode());
+                (proof, merkleized)
+            }
+        };
+        let on_parent = !pending.is_empty();
         let post = Commitment::<F>::from_parts(merkleized.bounds().tip.size, merkleized.root())
             .expect("post commitment");
 
@@ -351,7 +385,7 @@ async fn run_family<F: Graftable>(context: deterministic::Context, input: FuzzIn
             flip_digest(&mut root);
             claimed_post = Commitment::<F>::from_parts(post.size(), root).unwrap();
             Some(&[VerifyError::PostCommitmentMismatch][..])
-        } else if fault == 7 && (db.is_empty() || batch.is_empty()) {
+        } else if fault == 7 && (pre_empty || batch.is_empty()) {
             None
         } else {
             corrupt(&mut forged, fault, open_below)
@@ -374,25 +408,92 @@ async fn run_family<F: Graftable>(context: deterministic::Context, input: FuzzIn
             );
         }
 
-        logical.apply_model(&mut model);
-        let next_db = db.apply_batch(merkleized).await.expect("apply batch");
-        db = next_db;
-        for index in 0..keyspace {
-            let key = harness::key(index);
-            assert_eq!(
-                db.get(&key).await.expect("database get"),
-                model.get(&key).cloned()
-            );
+        logical.apply_model(&mut proved_model);
+        pending.push_back(Pending {
+            round,
+            logical,
+            reprove: on_parent.then_some(writer_before),
+            bundle: proof.encode().to_vec(),
+            merkleized,
+        });
+        while pending.len() > usize::from(input.depth) {
+            let oldest = pending.pop_front().unwrap();
+            db = apply_pending(db, oldest, &mut model, keyspace).await;
         }
-        assert_eq!(db.is_empty(), model.is_empty());
         pre = post;
-        if round % 4 == 0 {
-            db = db.sync().await.unwrap();
-            let boundary = db.sync_boundary();
-            db = db.prune(boundary).await.unwrap();
-        }
+    }
+    while let Some(oldest) = pending.pop_front() {
+        db = apply_pending(db, oldest, &mut model, keyspace).await;
     }
     db.destroy().await.expect("destroy fuzz database");
+}
+
+/// A merkleized batch the database has not applied.
+type Merkleized<F> = Arc<
+    commonware_storage::qmdb::current::batch::MerkleizedBatch<
+        F,
+        Digest,
+        commonware_storage::qmdb::any::ordered::fixed::Update<Key, Value>,
+        { harness::CHUNK_BYTES },
+        commonware_parallel::Sequential,
+    >,
+>;
+
+/// A proved batch waiting to be applied.
+struct Pending<F: Graftable> {
+    round: usize,
+    logical: harness::LogicalBatch,
+    /// The writer's policy before the batch, and whether the batch was proved on a pending
+    /// parent, so proving it from the database must give the same bundle.
+    reprove: Option<FuzzPolicy>,
+    bundle: Vec<u8>,
+    merkleized: Merkleized<F>,
+}
+
+/// Apply `pending`, the oldest proved batch, to `db`, now at its pre-state, and check the
+/// database against `model`.
+async fn apply_pending<F: Graftable>(
+    db: harness::ScenarioDb<F>,
+    pending: Pending<F>,
+    model: &mut BTreeMap<Key, Value>,
+    keyspace: u64,
+) -> harness::ScenarioDb<F> {
+    let Pending {
+        round,
+        logical,
+        reprove,
+        bundle,
+        merkleized,
+    } = pending;
+    if let Some(mut policy) = reprove {
+        let (direct, batch) = logical
+            .batch
+            .prove(&db, &mut policy)
+            .await
+            .expect("the database proves the batch once its parent is applied");
+        assert_eq!(
+            direct.encode().to_vec(),
+            bundle,
+            "a pending parent changed the bundle"
+        );
+        assert_eq!(batch.root(), merkleized.root());
+    }
+    logical.apply_model(model);
+    let mut db = db.apply_batch(merkleized).await.expect("apply batch");
+    for index in 0..keyspace {
+        let key = harness::key(index);
+        assert_eq!(
+            db.get(&key).await.expect("database get"),
+            model.get(&key).cloned()
+        );
+    }
+    assert_eq!(db.is_empty(), model.is_empty());
+    if round % 4 == 0 {
+        db = db.sync().await.unwrap();
+        let boundary = db.sync_boundary();
+        db = db.prune(boundary).await.unwrap();
+    }
+    db
 }
 
 const FAULTS: u8 = 31;
