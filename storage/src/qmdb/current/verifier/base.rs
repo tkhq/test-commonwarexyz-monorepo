@@ -34,11 +34,8 @@ use commonware_cryptography::Hasher;
 use commonware_parallel::Strategy;
 use commonware_utils::{NZU64, futures::try_join_all, range::contains_cyclic};
 use core::ops::{Bound, RangeBounds as _};
-use futures::{StreamExt as _, pin_mut};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-};
+use futures::{StreamExt as _, TryStreamExt as _, pin_mut};
+use std::{collections::BTreeSet, sync::Arc};
 
 type OrderedUpdate<K, V> = update::Ordered<K, V>;
 type ExactRecord<F, K, V> = (Location<F>, OrderedUpdate<K, V>);
@@ -292,78 +289,98 @@ where
         Ok(None)
     }
 
-    /// The newest change the chain made to each key it changed in `range`: whether the key is
-    /// active after it.
-    fn changed_in(&self, range: &(Bound<K>, Bound<K>)) -> BTreeMap<&'a K, bool> {
-        let mut changed = BTreeMap::new();
-        for diff in self.diffs() {
-            let start = match &range.0 {
-                Bound::Included(start) => diff.partition_point(|(key, _)| key < start),
-                Bound::Excluded(start) => diff.partition_point(|(key, _)| key <= start),
-                Bound::Unbounded => 0,
-            };
-            for (key, entry) in diff
-                .iter()
-                .skip(start)
-                .take_while(|(key, _)| range.contains(key))
-            {
-                changed.entry(key).or_insert_with(|| entry.loc().is_some());
-            }
-        }
-        changed
-    }
-
     /// The active keys in `range` in this state, ascending.
+    ///
+    /// Under a chain, the database still holds the keys the chain deleted, so the read follows
+    /// this state's successor links from the range's first active key instead of scanning the
+    /// database's keys: it reads one record per active key in the range.
     pub(super) async fn keys_in(
         &self,
         range: (Bound<K>, Bound<K>),
-    ) -> Result<Vec<K>, qmdb::Error<F>> {
-        let changed = self.changed_in(&range);
-        let stream = self.db.stream_range(range);
-        pin_mut!(stream);
-        let mut keys = Vec::new();
-        while let Some(record) = stream.next().await {
-            let (key, _) = record?;
-            if !changed.contains_key(&key) {
-                keys.push(key);
-            }
+    ) -> Result<Vec<K>, BuildError<F>> {
+        if self.tip.is_none() {
+            return Ok(self.db.keys(range).try_collect().await?);
         }
-        if !changed.is_empty() {
-            keys.extend(
-                changed
-                    .into_iter()
-                    .filter(|(_, active)| *active)
-                    .map(|(key, _)| key.clone()),
-            );
-            keys.sort();
+        let mut keys = Vec::new();
+        let mut next = match &range.0 {
+            Bound::Unbounded => self.first_key().await?,
+            Bound::Included(start) | Bound::Excluded(start) => {
+                self.span_owner(start).await?.map(|(_, owner)| {
+                    if owner.key == *start && range.contains(start) {
+                        keys.push(owner.key);
+                    }
+                    owner.next_key
+                })
+            }
+        };
+        // The links end the range past its end, or where they wrap around to the least key.
+        while let Some(key) =
+            next.take_if(|key| range.contains(key) && keys.last().is_none_or(|last| *key > *last))
+        {
+            let Some((_, update)) = self.member(&key).await? else {
+                return Err(BuildError::InvalidState(
+                    "an active record links to an absent key",
+                ));
+            };
+            next = Some(update.next_key);
+            keys.push(key);
         }
         Ok(keys)
     }
 
     /// The least active key in this state, if any.
-    pub(super) async fn first_key(&self) -> Result<Option<K>, qmdb::Error<F>> {
-        if self.tip.is_some_and(|tip| tip.inner.total_active_keys == 0) {
-            return Ok(None);
-        }
-        let changed = self.changed_in(&(Bound::Unbounded, Bound::Unbounded));
-        let first_changed = changed
-            .iter()
-            .find(|(_, active)| **active)
-            .map(|(key, _)| (*key).clone());
-        // The database's least key the chain left alone: the chain changed every key before it.
+    pub(super) async fn first_key(&self) -> Result<Option<K>, BuildError<F>> {
         let stream = self.db.keys(..);
         pin_mut!(stream);
-        let mut first_kept = None;
-        while let Some(key) = stream.next().await.transpose()? {
-            if !changed.contains_key(&key) {
-                first_kept = Some(key);
-                break;
+        let first = stream.next().await.transpose()?;
+        let Some(tip) = self.tip else {
+            return Ok(first);
+        };
+        if tip.inner.total_active_keys == 0 {
+            return Ok(None);
+        }
+        // The database's least key, if the chain kept it. If the chain deleted it, its span
+        // owner is either the greatest key, which links to the least, or a lesser key the chain
+        // created.
+        let mut kept = None;
+        if let Some(first) = first {
+            let Some((_, owner)) = self.span_owner(&first).await? else {
+                return Err(BuildError::InvalidState(
+                    "a nonempty pending state has no span owner",
+                ));
+            };
+            if owner.key == first {
+                kept = Some(first);
+            } else if owner.next_key <= owner.key {
+                return Ok(Some(owner.next_key));
             }
         }
-        Ok(match (first_changed, first_kept) {
-            (Some(changed), Some(kept)) => Some(changed.min(kept)),
-            (changed, kept) => changed.or(kept),
+        let created = self.first_created();
+        Ok(match (kept, created) {
+            (Some(kept), Some(created)) => Some(kept.min(created.clone())),
+            (kept, created) => kept.or_else(|| created.cloned()),
         })
+    }
+
+    /// The least key whose newest change in the chain leaves it active.
+    fn first_created(&self) -> Option<&'a K> {
+        let diffs = self.diffs().collect::<Vec<_>>();
+        diffs
+            .iter()
+            .copied()
+            .enumerate()
+            .filter_map(|(layer, diff)| {
+                diff.iter()
+                    .find(|(key, entry)| {
+                        entry.loc().is_some()
+                            && diffs
+                                .iter()
+                                .take(layer)
+                                .all(|newer| lookup_sorted(newer, key).is_none())
+                    })
+                    .map(|(key, _)| key)
+            })
+            .min()
     }
 
     /// The opening of this state: its terminal commit's raw proof, the frontier before it,
