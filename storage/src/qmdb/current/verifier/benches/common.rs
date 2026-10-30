@@ -5,17 +5,20 @@
 //! strategies use the same Tokio storage backend and seeded workload.
 
 use super::harness;
-use commonware_cryptography::Sha256;
+use commonware_cryptography::{Sha256, sha256::Digest};
 use commonware_parallel::Strategy;
 use commonware_storage::{
     merkle::Graftable,
     qmdb::{
-        any::value::FixedEncoding,
-        current::verifier::{BatchProofBundle, CurrentCommitment, TrustedMap, UserBatch},
+        any::{ordered::fixed::Update, value::FixedEncoding},
+        current::{
+            batch::MerkleizedBatch,
+            verifier::{BatchProofBundle, CurrentCommitment, TrustedMap, UserBatch},
+        },
         floor::Proportional,
     },
 };
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 /// Initial key counts. Upstream's nightly benchmark job builds with `--cfg full_bench`.
 #[cfg(not(full_bench))]
@@ -50,6 +53,11 @@ pub(crate) type Proof<F> = BatchProofBundle<
     { harness::CHUNK_BYTES },
 >;
 
+/// A merkleized batch the fixture's database has not applied.
+pub(crate) type Pending<F, S> = Arc<
+    MerkleizedBatch<F, Digest, Update<harness::Key, harness::Value>, { harness::CHUNK_BYTES }, S>,
+>;
+
 /// Validated database, batch, and proof shared by both timed operations.
 pub(crate) struct Fixture<
     F: Graftable,
@@ -57,13 +65,18 @@ pub(crate) struct Fixture<
     S: Strategy,
 > {
     pub(crate) database: harness::ScenarioDb<F, E, S>,
+    /// Pending batches under the measured one, oldest first: it is proved on the last.
+    pub(crate) pending: Vec<Pending<F, S>>,
     pub(crate) batch: UserBatch<harness::Key, harness::Value>,
     pub(crate) pre: Commitment<F>,
     pub(crate) proof: Proof<F>,
     pub(crate) post: Commitment<F>,
 }
 
-/// Prepare the seeded database and normalized batch outside the measured region.
+/// Prepare the seeded database and normalized batch outside the measured region, with `depth`
+/// batches of the same size between them: pending, or with `apply`, applied, so that the same
+/// batch is proved from the same state either way.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn prepare<
     F: Graftable,
     E: commonware_storage::Context + commonware_runtime::Spawner,
@@ -75,6 +88,8 @@ pub(crate) async fn prepare<
     seed: u64,
     partition: &str,
     strategy: S,
+    depth: usize,
+    apply: bool,
 ) -> Fixture<F, E, S> {
     let mut database =
         harness::open_db_with_strategy::<F, _, _>(context, partition, strategy).await;
@@ -88,16 +103,46 @@ pub(crate) async fn prepare<
         .await
         .unwrap();
     database = database.apply_batch(initial).await.unwrap();
+    let mut pending = Vec::<Pending<F, S>>::new();
+    for _ in 0..depth {
+        let logical = generator.next_batch(action_count);
+        logical.apply_model(&mut model);
+        let (_, merkleized) = match pending.last() {
+            Some(parent) => logical
+                .batch
+                .prove_on(parent, &database, &mut Proportional)
+                .await
+                .unwrap(),
+            None => logical
+                .batch
+                .prove(&database, &mut Proportional)
+                .await
+                .unwrap(),
+        };
+        pending.push(merkleized);
+    }
+    if apply {
+        for merkleized in pending.drain(..) {
+            database = database.apply_batch(merkleized).await.unwrap();
+        }
+    }
 
     let logical = generator.next_batch(action_count);
     logical.apply_model(&mut model);
     let batch = logical.batch;
-    let pre = Commitment::<F>::from_parts(database.bounds().end, database.root()).unwrap();
-    let proof = batch
-        .build_batch_proof(&database, &Proportional)
-        .await
-        .unwrap();
-    let merkleized = batch.merkleize(&database, &mut Proportional).await.unwrap();
+    let (pre, (proof, merkleized)) = match pending.last() {
+        Some(parent) => (
+            Commitment::<F>::from_parts(parent.bounds().tip.size, parent.root()).unwrap(),
+            batch
+                .prove_on(parent, &database, &mut Proportional)
+                .await
+                .unwrap(),
+        ),
+        None => (
+            Commitment::<F>::from_parts(database.bounds().end, database.root()).unwrap(),
+            batch.prove(&database, &mut Proportional).await.unwrap(),
+        ),
+    };
     let post =
         Commitment::<F>::from_parts(merkleized.bounds().tip.size, merkleized.root()).unwrap();
     assert_eq!(
@@ -123,6 +168,7 @@ pub(crate) async fn prepare<
     assert_eq!(verified.commitment(), &post);
     Fixture {
         database,
+        pending,
         batch,
         pre,
         proof,
