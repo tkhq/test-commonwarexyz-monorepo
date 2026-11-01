@@ -292,7 +292,7 @@ mod tests {
         // Note that we're using a deterministic network, so both networks can use
         // the same address because we're not actually binding to it.
         let listener_addr = SocketAddr::from(([127, 0, 0, 1], 1234));
-        let listeners = [
+        let mut listeners = [
             networks[0].bind(listener_addr).await.unwrap(),
             networks[1].bind(listener_addr).await.unwrap(),
         ];
@@ -300,7 +300,7 @@ mod tests {
 
         // Step 2: Run the same ordered exchange on each network so audit equality does
         // not depend on how the runtime schedules separate client and server tasks.
-        for (network, mut listener) in zip_eq(&networks, listeners) {
+        for (network, listener) in zip_eq(&networks, &mut listeners) {
             let (mut client_sink, mut client_stream) = network.dial(listener_addr).await.unwrap();
             let (_, mut server_sink, mut server_stream) = listener.accept().await.unwrap();
 
@@ -315,7 +315,8 @@ mod tests {
         }
         verify_auditors("after network operations");
 
-        // Step 3: Test error conditions (attempting to bind to same address again)
+        // Step 3: Test error conditions (attempting to bind to same address again,
+        // while its listener is alive)
         for network in &networks {
             let result = network.bind(listener_addr).await;
             assert!(result.is_err());
