@@ -17,9 +17,27 @@ pub type Sink = mocks::Sink;
 pub type Stream = mocks::Stream;
 
 /// Implementation of [crate::Listener] for a deterministic [Network].
+///
+/// Dropping it frees its address for another [crate::Network::bind].
 pub struct Listener {
     address: SocketAddr,
     listener: mpsc::UnboundedReceiver<(SocketAddr, mocks::Sink, mocks::Stream)>,
+    listeners: Listeners,
+}
+
+impl Drop for Listener {
+    fn drop(&mut self) {
+        // Closing the receiver closes its sender, so only this listener's entry
+        // is removed: one a later listener made would still be open.
+        self.listener.close();
+        let mut listeners = self.listeners.lock();
+        if listeners
+            .get(&self.address)
+            .is_some_and(mpsc::UnboundedSender::is_closed)
+        {
+            listeners.remove(&self.address);
+        }
+    }
 }
 
 impl crate::Listener for Listener {
@@ -42,16 +60,19 @@ type Dialable = mpsc::UnboundedSender<(
     mocks::Stream, // Dialer -> Listener
 )>;
 
+type Listeners = Arc<Mutex<HashMap<SocketAddr, Dialable>>>;
+
 /// Deterministic implementation of [crate::Network].
 ///
-/// When a dialer connects to a listener, the listener is given a new ephemeral port
-/// from the range `32768..61000`. To keep things simple, it is not possible to
-/// bind to an ephemeral port. Likewise, if ports are not reused and when exhausted,
-/// the runtime will panic.
+/// When a dialer connects to a listener, the listener is given the next ephemeral
+/// port from the range `32768..61000`, starting again from its beginning once it
+/// is used up: a dialer's port only labels the connection, which nothing reaches
+/// by it. To keep things simple, it is not possible to bind to an ephemeral port.
+/// A dropped listener frees its address.
 #[derive(Clone)]
 pub struct Network {
     ephemeral: Arc<Mutex<u16>>,
-    listeners: Arc<Mutex<HashMap<SocketAddr, Dialable>>>,
+    listeners: Listeners,
 }
 
 impl Default for Network {
@@ -77,7 +98,10 @@ impl crate::Network for Network {
 
         // Ensure the port is not already bound
         let mut listeners = self.listeners.lock();
-        if listeners.contains_key(&socket) {
+        if listeners
+            .get(&socket)
+            .is_some_and(|sender| !sender.is_closed())
+        {
             return Err(Error::BindFailed);
         }
 
@@ -87,6 +111,7 @@ impl crate::Network for Network {
         Ok(Listener {
             address: socket,
             listener: receiver,
+            listeners: self.listeners.clone(),
         })
     }
 
@@ -95,9 +120,11 @@ impl crate::Network for Network {
         let dialer = {
             let mut ephemeral = self.ephemeral.lock();
             let dialer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), *ephemeral);
-            *ephemeral = ephemeral
-                .checked_add(1)
-                .expect("ephemeral port range exhausted");
+            *ephemeral = if *ephemeral + 1 < EPHEMERAL_PORT_RANGE.end {
+                *ephemeral + 1
+            } else {
+                EPHEMERAL_PORT_RANGE.start
+            };
             dialer
         };
 
@@ -121,11 +148,12 @@ impl crate::Network for Network {
 #[cfg(test)]
 mod tests {
     use crate::{
-        Clock, Runner, Spawner,
+        Clock, Error, Listener as _, Network as _, Runner, Spawner,
         network::{deterministic as DeterministicNetwork, tests},
     };
     use commonware_macros::test_group;
     use rstest::rstest;
+    use std::net::SocketAddr;
 
     #[rstest]
     #[case::tokio(crate::tokio::Runner::default())]
@@ -136,6 +164,39 @@ mod tests {
     {
         runner.start(|context| async move {
             tests::test_network_trait(context, DeterministicNetwork::Network::default).await;
+        });
+    }
+
+    #[test]
+    fn test_dropped_listener_frees_its_address() {
+        crate::deterministic::Runner::default().start(|_| async move {
+            let network = DeterministicNetwork::Network::default();
+            let address = SocketAddr::from(([127, 0, 0, 1], 3000));
+            let listener = network.bind(address).await.unwrap();
+            assert!(matches!(
+                network.bind(address).await,
+                Err(Error::BindFailed)
+            ));
+            drop(listener);
+            let _listener = network.bind(address).await.unwrap();
+            assert!(network.dial(address).await.is_ok());
+        });
+    }
+
+    #[test]
+    fn test_ephemeral_ports_wrap() {
+        crate::deterministic::Runner::default().start(|_| async move {
+            let network = DeterministicNetwork::Network::default();
+            let address = SocketAddr::from(([127, 0, 0, 1], 3000));
+            let mut listener = network.bind(address).await.unwrap();
+            let range = super::EPHEMERAL_PORT_RANGE;
+            for _ in range.clone() {
+                let (_sink, _stream) = network.dial(address).await.unwrap();
+                listener.accept().await.unwrap();
+            }
+            let _connection = network.dial(address).await.unwrap();
+            let (dialer, _, _) = listener.accept().await.unwrap();
+            assert_eq!(dialer.port(), range.start);
         });
     }
 
