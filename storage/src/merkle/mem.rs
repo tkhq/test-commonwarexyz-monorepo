@@ -27,6 +27,10 @@ pub struct Config<F: Family, D: Digest> {
     pub pinned_nodes: Vec<D>,
 }
 
+/// Pruning shrinks the buffer of retained nodes only past this many nodes of capacity, so that
+/// small buffers are never reallocated.
+const SHRINK_FLOOR: usize = 1 << 12;
+
 /// A basic, `no_std`-compatible Merkle structure where all nodes are stored in-memory.
 ///
 /// Nodes are either _retained_, _pruned_, or _pinned_. Retained nodes are stored in the main deque.
@@ -298,6 +302,11 @@ impl<F: Family, D: Digest> Mem<F, D> {
         let retained_nodes = self.pos_to_index(pos);
         self.pinned_nodes = pinned;
         self.nodes.drain(0..retained_nodes);
+        // Draining keeps the buffer's capacity: after a large replay (a reopen, or a sync from a
+        // peer) is flushed and pruned, it would otherwise hold that replay's size for good.
+        if self.nodes.capacity() > SHRINK_FLOOR && self.nodes.capacity() > 4 * self.nodes.len() {
+            self.nodes.shrink_to(2 * self.nodes.len());
+        }
         self.pruning_boundary = pos;
     }
 
@@ -521,6 +530,21 @@ mod tests {
         };
         mem.apply_batch(&batch).unwrap();
         mem
+    }
+
+    /// Pruning a large structure gives back the buffer that held what it pruned.
+    #[test]
+    fn prune_shrinks_capacity() {
+        let hasher: H = Standard::new(ForwardFold);
+        let mut mem = build::<crate::mmr::Family>(&hasher, 100_000);
+        let full = mem.nodes.capacity();
+        assert!(full >= 100_000);
+        mem.prune_all();
+        assert!(
+            mem.nodes.capacity() <= SHRINK_FLOOR,
+            "{} of {full} kept",
+            mem.nodes.capacity()
+        );
     }
 
     fn empty<F: Family>() {
